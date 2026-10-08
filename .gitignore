@@ -1,0 +1,10 @@
+release/*.pdb
+release/*.exp
+release/*.lib
+release/*.obj
+scripts/bin/
+*.log
+SpiderFixBackup_*/
+cache.pso*
+.vs/
+*.pdb
