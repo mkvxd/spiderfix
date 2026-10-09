@@ -1,0 +1,20 @@
+# spiderfix.ini (opcional, ao lado da d3d12.dll na pasta do jogo).
+# Chave presente vence a variavel de ambiente. 0 desliga, 1 liga.
+
+# Log mestre: 0 off, 1 com orcamento (padrao)
+Log = 1
+
+# Nivel de detalhe: 0 off, 1 com orcamento (padrao), 2 sem limite
+LogLevel = 1
+
+# Forca o fix mesmo em GPU 12_1+ (padrao 0)
+ForceActive = 0
+
+# Retry de PSO depth-only sem pixel shader (padrao 1; sem ele o jogo trava)
+DepthRetry = 1
+
+# Encapsula ID3D12PipelineLibrary para retry em loads do cache.pso (padrao 1)
+HookPipelineLibrary = 1
+
+# Aviso visual de 4s na inicializacao (padrao 1)
+ShowOSD = 1

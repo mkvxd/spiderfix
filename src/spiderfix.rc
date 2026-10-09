@@ -1,0 +1,30 @@
+#include <windows.h>
+
+// Mantido em sincronia manual com SPIDERFIX_VERSION (0x00010100 = v1.1.0).
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION     1,1,0,0
+    PRODUCTVERSION  1,1,0,0
+    FILEFLAGSMASK   0x3F
+    FILEFLAGS       0x0
+    FILEOS          VOS_NT_WINDOWS32
+    FILETYPE        VFT_DLL
+    FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "SpiderFix"
+            VALUE "FileDescription",  "SpiderFix d3d12 proxy"
+            VALUE "FileVersion",      "1.1.0"
+            VALUE "InternalName",     "SpiderFix"
+            VALUE "OriginalFilename", "d3d12.dll"
+            VALUE "ProductName",      "SpiderFix"
+            VALUE "ProductVersion",   "1.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

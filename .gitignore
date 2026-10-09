@@ -2,6 +2,7 @@ release/*.pdb
 release/*.exp
 release/*.lib
 release/*.obj
+release/*.res
 scripts/bin/
 *.log
 SpiderFixBackup_*/

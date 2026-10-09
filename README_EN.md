@@ -42,6 +42,14 @@ Uninstall restores the backup and deletes the folders it created. It refuses to 
 | `SPIDERFIX_LOG=0` | Disables logging to `spiderfix.log` |
 | `SPIDERFIX_DEPTH_RETRY=0` | Disables the depth-only retry (the game hangs without it) |
 
+`spiderfix.ini` next to the DLL (see `spiderfix.ini.example`) tunes the same without variables: `Log`, `LogLevel`, `ForceActive`, `DepthRetry`, `HookPipelineLibrary`, `ShowOSD`.
+
+The first boot shows a SpiderFix notice for 4 seconds (`ShowOSD=0` disables it).
+
+## Graphical interface
+
+`scripts\SpiderFixGUI.ps1` opens a window with install, uninstall, `cache.pso` toggle and one-click diagnostics export to the Desktop.
+
 ## Build
 
 ```powershell

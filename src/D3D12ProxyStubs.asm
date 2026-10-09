@@ -1,13 +1,14 @@
 OPTION CASEMAP:NONE
 
 ; Repasse por jump-table preenchida no InitOriginalD3D12 (g_procs).
-; Caminho rapido vira so mov/test/jmp: preserva XMM0-3 e nao precisa de unwind
-; (sem call/prologo: unwinder trata como folha, como thunk padrao de proxy).
-; Se a entrada ainda for nula (jogo chamou export antes de D3D12CreateDevice,
-; ex. via DeviceFactory), tail-jmp para SpiderFixSlowResolve com idx em ecx:
-; stub continua folha. Slow path tem FRAME real, salva XMM0-3 e resolve via C++.
-; Entradas ausentes apontam para fallback local (E_NOTIMPL p/ HRESULT,
-; 0 p/ ponteiro/void/UINT64).
+; Caminho rapido vira so mov/test/jmp: preserva tudo (so R10/R11, scratch
+; nao-argumento, sao tocados), nao precisa de unwind (sem call/prologo).
+; Entrada nula (jogo chamou export antes de D3D12CreateDevice, ex. via
+; DeviceFactory): idx vai em R11 (scratch, nunca argumento) e tail-jmp para
+; SpiderFixSlowResolve, stub continua folha. Slow path tem FRAME real, salva
+; RCX/RDX/R8/R9 + XMM0-3 (todos volateis que a chamada C++ suja), resolve,
+; restaura tudo e jmp. Entradas ausentes apontam para fallback local
+; (E_NOTIMPL p/ HRESULT, 0 p/ ponteiro/void/UINT64).
 ; Ordem dos indices sincronizada com kNames em SpiderD3D12Proxy.cpp.
 
 EXTERN g_procs:QWORD
@@ -20,30 +21,38 @@ procName PROC
     mov r10, qword ptr [g_procs + idx*8]
     test r10, r10
     jnz @F
-    mov ecx, idx
+    mov r11d, idx
     jmp SpiderFixSlowResolve
 @@: jmp r10
 procName ENDP
 ENDM
 
-; idx em ecx. Salva XMM0-3 (volateis que a chamada C++ pode sujar), resolve,
-; restaura e jmp. Frame 0C8h mantem rsp 16-alinhado p/ movaps e call.
+; idx em r11d na entrada. Frame 68h mantem rsp 16-alinhado p/ movaps e call.
 SpiderFixSlowResolve PROC FRAME
-    sub rsp, 0C8h
-    .allocstack 0C8h
+    sub rsp, 68h
+    .allocstack 68h
     .endprolog
-    movaps [rsp+88h], xmm0
-    movaps [rsp+98h], xmm1
-    movaps [rsp+0A8h], xmm2
-    movaps [rsp+0B8h], xmm3
-    mov [rsp+80h], rcx
+    mov [rsp+40h], rcx
+    mov [rsp+48h], rdx
+    mov [rsp+50h], r8
+    mov [rsp+58h], r9
+    movaps [rsp+00h], xmm0
+    movaps [rsp+10h], xmm1
+    movaps [rsp+20h], xmm2
+    movaps [rsp+30h], xmm3
+    mov [rsp+60h], r11
+    mov ecx, r11d
     call SpiderFixResolveProc
-    movaps xmm0, [rsp+88h]
-    movaps xmm1, [rsp+98h]
-    movaps xmm2, [rsp+0A8h]
-    movaps xmm3, [rsp+0B8h]
+    mov rcx, [rsp+40h]
+    mov rdx, [rsp+48h]
+    mov r8, [rsp+50h]
+    mov r9, [rsp+58h]
+    movaps xmm0, [rsp+00h]
+    movaps xmm1, [rsp+10h]
+    movaps xmm2, [rsp+20h]
+    movaps xmm3, [rsp+30h]
     mov r10, rax
-    add rsp, 0C8h
+    add rsp, 68h
     jmp r10
 SpiderFixSlowResolve ENDP
 

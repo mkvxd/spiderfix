@@ -19,12 +19,29 @@ function Get-PEMachine([string]$Path) {
     $fs = [System.IO.File]::OpenRead($Path)
     try {
         $br = New-Object System.IO.BinaryReader($fs)
+        if ($br.ReadUInt16() -ne 0x5A4D) {
+            throw "Sem assinatura MZ: $Path"
+        }
         $fs.Position = 0x3C
         $lf = $br.ReadInt32()
-        $fs.Position = $lf + 4
+        if ($lf -lt 0 -or $lf -gt $fs.Length - 6) {
+            throw "Cabecalho PE invalido: $Path"
+        }
+        $fs.Position = $lf
+        if ($br.ReadUInt32() -ne 0x00004550) {
+            throw "Sem assinatura PE: $Path"
+        }
         return $br.ReadUInt16()
     } finally {
         $br.Close()
+    }
+}
+
+function Test-SpiderFixDll([string]$Path) {
+    try {
+        return ((Get-Item -LiteralPath $Path).VersionInfo.ProductName -eq "SpiderFix")
+    } catch {
+        return $false
     }
 }
 
@@ -32,7 +49,7 @@ function Test-AdminWrite([string]$Dir) {
     try {
         $t = Join-Path $Dir ".spiderfix_write_test"
         [System.IO.File]::WriteAllText($t, "x")
-        Remove-Item -LiteralPath $t -Force
+        [System.IO.File]::Delete($t) # .NET: funciona mesmo em -WhatIf.
         return $true
     } catch {
         return $false
@@ -58,7 +75,7 @@ if ($proc) {
 
 if (!(Test-AdminWrite $GamePath)) {
     Write-Host "Sem escrita em $GamePath. Relancando como administrador..."
-    Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -GamePath `"$GamePath`""
+    Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`" -GamePath `"$GamePath`""
     exit 0
 }
 
@@ -75,8 +92,10 @@ if (Test-Path -LiteralPath $target) {
         Write-Host "Proxy ja instalada (hash igual). Nada a copiar."
         exit 0
     }
-    # Backup unico e fixo: nunca sobrescreve o original com a propria proxy.
-    if (!(Test-Path -LiteralPath $backupDir)) {
+    if (Test-SpiderFixDll $target) {
+        Write-Host "Proxy antiga detectada pelo marcador. Atualizando sem novo backup."
+    } elseif (!(Test-Path -LiteralPath $backupDir)) {
+        # Backup unico e fixo, so de arquivo que nao e a proxy.
         if ($PSCmdlet.ShouldProcess($backupDir, "Criar backup original")) {
             New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
             Copy-Item -LiteralPath $target -Destination (Join-Path $backupDir "d3d12.dll") -Force
@@ -103,9 +122,11 @@ if ($PSCmdlet.ShouldProcess($target, "Instalar proxy d3d12.dll")) {
 Write-Host "Fix instalado em:"
 Write-Host $target
 Write-Host ""
-Write-Host "Backup original em:"
-Write-Host $backupDir
-Write-Host ""
+if (Test-Path -LiteralPath $backupDir) {
+    Write-Host "Backup original em:"
+    Write-Host $backupDir
+    Write-Host ""
+}
 
 if (Test-Path -LiteralPath $cache) {
     Write-Host "Dica: se o jogo travar no loading, renomeie cache.pso para cache.pso.disabled."

@@ -7,20 +7,18 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <new>
 
 // SpiderFix - proxy d3d12.dll para Marvel's Spider-Man 2 em GPU sem FL 12_1.
 // Funcao principal: fallback de feature level em D3D12CreateDevice, spoof de
 // FEATURE_LEVELS para 12_0, retry de PSO depth-only, supressao do aviso de GPU.
 //
 // Limitacoes conhecidas (nao cobertas, sem quebrar o jogo):
-// - Retry depth-only cobre ID3D12Device::CreateGraphicsPipelineState (vtable 10).
-//   ID3D12Device2::CreatePipelineState (stream, vtable 47) e
-//   ID3D12PipelineLibrary::LoadGraphicsPipeline (cache.pso) nao passam pelo retry.
 // - Devices criados via D3D12GetInterface/DeviceFactory nao passam pelo fallback.
 // - IAT patch cobre user32.dll do exe (MessageBoxA/W/ExA/ExW). Delay-load, outras
 //   DLLs, MessageBoxIndirect e TaskDialog nao sao cobertos.
 // - Retry remove o PS: se ele faz alpha-test (clip/discard) ou escreve SV_Depth,
-// sombra/profundidade sai errada nesses PSOs. Jogo vivo > pixel perfeito.
+//   sombra/profundidade sai errada nesses PSOs. Jogo vivo > pixel perfeito.
 
 #ifndef DXGI_ERROR_UNSUPPORTED
 #define DXGI_ERROR_UNSUPPORTED 0x887A0004L
@@ -39,16 +37,38 @@ using CreateGraphicsPipelineState_t = HRESULT(STDMETHODCALLTYPE*)(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC*,
     REFIID,
     void**);
+using CreatePipelineState_t = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12Device2*,
+    const D3D12_PIPELINE_STATE_STREAM_DESC*,
+    REFIID,
+    void**);
+using CreatePipelineLibrary_t = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    const void*,
+    SIZE_T,
+    REFIID,
+    void**);
 
-// Indices na vtable de ID3D12Device (apos IUnknown + ID3D12Object + ID3D12DeviceChild).
+// Indices na vtable contados na declaracao do SDK (d3d12.h): 10
+// CreateGraphicsPipelineState e 13 CheckFeatureSupport (ID3D12Device, apos
+// IUnknown + ID3D12Object + ID3D12DeviceChild); 44 CreatePipelineLibrary
+// (ID3D12Device1); 47 CreatePipelineState (ID3D12Device2, stream desc).
 static constexpr size_t kCreateGraphicsPipelineStateVtableIndex = 10;
 static constexpr size_t kCheckFeatureSupportVtableIndex = 13;
+static constexpr size_t kCreatePipelineLibraryVtableIndex = 44;
+static constexpr size_t kCreatePipelineStateVtableIndex = 47;
 static constexpr size_t kMaxVtableHooks = 8;
 static constexpr ULONGLONG kMaxLogBytes = 512 * 1024;
 
 static INIT_ONCE g_d3d12InitOnce = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE g_configOnce = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE g_msgboxOnce = INIT_ONCE_STATIC_INIT;
+static INIT_ONCE g_detectOnce = INIT_ONCE_STATIC_INIT;
+static LONG g_needsFix = -1; // -1 = nao sondado, 0 = bypass 12_1+, 1 = fix ativo
+
+// Sonda a GPU uma unica vez: device temporario em 11_0 + leitura do nivel
+// nativo. Falha de sonda assume fix (comportamento seguro anterior).
+static BOOL CALLBACK DetectGpuNeed(PINIT_ONCE, PVOID, PVOID*);
 static SRWLOCK g_devicePatchLock = SRWLOCK_INIT;
 static SRWLOCK g_logLock = SRWLOCK_INIT;
 
@@ -65,6 +85,8 @@ struct VtableHook {
     void* vtable;
     CheckFeatureSupport_t check;
     CreateGraphicsPipelineState_t pso;
+    CreatePipelineState_t psoStream;
+    CreatePipelineLibrary_t libCreate;
 };
 static VtableHook g_vhooks[kMaxVtableHooks] = {};
 static size_t g_vhookCount = 0;
@@ -80,12 +102,115 @@ static void* WINAPI SpiderFixZero() { return nullptr; }
 alignas(64) static LONG g_featureLogBudget = 80;
 alignas(64) static LONG g_psoFailureLogBudget = 80;
 
-static LONG g_logDisabled = 0; // 1 = SPIDERFIX_LOG=0
+static LONG g_logDisabled = 0; // 1 = log desligado
+static LONG g_logLevel = 1;    // 0 = off, 1 = com orcamento, 2 = sem limite
 static LONG g_depthRetry = 1;  // 0 = SPIDERFIX_DEPTH_RETRY=0
+static LONG g_hookLib = 1;     // 0 = sem wrapper de PipelineLibrary
+static LONG g_showOsd = 1;     // 0 = sem aviso visual
 static HANDLE g_hLog = INVALID_HANDLE_VALUE;
 static ULONGLONG g_logBytes = 0;
 static LONG g_logFull = 0;
 static wchar_t g_logPath[MAX_PATH] = {};
+
+static void ApplyIniValue(const char* key, const char* value) {
+    int v = -1;
+    if (value[0] >= '0' && value[0] <= '2' && value[1] == '\0') {
+        v = value[0] - '0';
+    } else if ((value[0] == 'Y' || value[0] == 'y') && value[1] == '\0') {
+        v = 1;
+    } else if ((value[0] == 'N' || value[0] == 'n') && value[1] == '\0') {
+        v = 0;
+    }
+    if (v < 0) {
+        return;
+    }
+    if (!_stricmp(key, "Log")) {
+        g_logDisabled = (v == 0) ? 1 : 0;
+        if (v > 0 && g_logLevel == 0) {
+            g_logLevel = 1;
+        }
+    } else if (!_stricmp(key, "LogLevel")) {
+        g_logLevel = (v > 2) ? 2 : v;
+        g_logDisabled = (g_logLevel == 0) ? 1 : 0;
+    } else if (!_stricmp(key, "ForceActive")) {
+        // Lido em D3D12CreateDevice via s_force; ini so liga.
+        if (v == 1) {
+            SetEnvironmentVariableA("SPIDERFIX_FORCE", "1");
+        }
+    } else if (!_stricmp(key, "DepthRetry")) {
+        g_depthRetry = (v == 0) ? 0 : 1;
+    } else if (!_stricmp(key, "HookPipelineLibrary")) {
+        g_hookLib = (v == 0) ? 0 : 1;
+    } else if (!_stricmp(key, "ShowOSD")) {
+        g_showOsd = (v == 0) ? 0 : 1;
+    }
+}
+
+// spiderfix.ini ao lado da DLL (Log, LogLevel 0|1|2, ForceActive, DepthRetry,
+// HookPipelineLibrary, ShowOSD). Chave presente vence a variavel de ambiente.
+static void LoadIniFile() {
+    HMODULE self = nullptr;
+    wchar_t dir[MAX_PATH] = {};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&LoadIniFile), &self) || !self ||
+        !GetModuleFileNameW(self, dir, MAX_PATH)) {
+        return;
+    }
+    wchar_t* slash = wcsrchr(dir, L'\\');
+    size_t dirLen = slash ? static_cast<size_t>(slash - dir + 1) : 0;
+    static const wchar_t kIni[] = L"spiderfix.ini";
+    if (dirLen + 14 >= MAX_PATH) {
+        return;
+    }
+    wchar_t path[MAX_PATH] = {};
+    memcpy(path, dir, dirLen * sizeof(wchar_t));
+    memcpy(path + dirLen, kIni, sizeof(kIni));
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    char text[4096] = {};
+    DWORD read = 0;
+    if (!ReadFile(h, text, sizeof(text) - 1, &read, nullptr)) {
+        CloseHandle(h);
+        return;
+    }
+    CloseHandle(h);
+    text[read < sizeof(text) ? read : sizeof(text) - 1] = '\0';
+    char* line = text;
+    while (line && *line) {
+        char* next = strchr(line, '\n');
+        if (next) {
+            *next = '\0';
+        }
+        while (*line == ' ' || *line == '\t' || *line == '\r') {
+            ++line;
+        }
+        if (*line && *line != '#' && *line != ';') {
+            char* eq = strchr(line, '=');
+            if (eq) {
+                *eq = '\0';
+                char* key = line;
+                char* value = eq + 1;
+                while (*value == ' ' || *value == '\t') {
+                    ++value;
+                }
+                char* kend = eq - 1;
+                while (kend > key && (*kend == ' ' || *kend == '\t' || *kend == '\r')) {
+                    *kend-- = '\0';
+                }
+                char* vend = value + strlen(value);
+                while (vend > value && (vend[-1] == ' ' || vend[-1] == '\t' || vend[-1] == '\r')) {
+                    *--vend = '\0';
+                }
+                ApplyIniValue(key, value);
+            }
+        }
+        line = next ? next + 1 : nullptr;
+    }
+}
 
 static BOOL CALLBACK InitConfig(PINIT_ONCE, PVOID, PVOID*) {
     char v[8] {};
@@ -93,6 +218,11 @@ static BOOL CALLBACK InitConfig(PINIT_ONCE, PVOID, PVOID*) {
     g_logDisabled = (n > 0 && (v[0] == '0' || v[0] == 'N' || v[0] == 'n')) ? 1 : 0;
     n = GetEnvironmentVariableA("SPIDERFIX_DEPTH_RETRY", v, sizeof(v));
     g_depthRetry = (n > 0 && (v[0] == '0' || v[0] == 'N' || v[0] == 'n')) ? 0 : 1;
+    n = GetEnvironmentVariableA("SPIDERFIX_HOOK_LIB", v, sizeof(v));
+    g_hookLib = (n > 0 && (v[0] == '0' || v[0] == 'N' || v[0] == 'n')) ? 0 : 1;
+    n = GetEnvironmentVariableA("SPIDERFIX_OSD", v, sizeof(v));
+    g_showOsd = (n > 0 && (v[0] == '0' || v[0] == 'N' || v[0] == 'n')) ? 0 : 1;
+    LoadIniFile();
     return TRUE;
 }
 
@@ -193,6 +323,12 @@ static void Log(const char* msg) {
     if (n > 0) {
         size_t len = static_cast<size_t>(n);
         if (len >= sizeof(line)) {
+            // Truncado sem quebrar o delimitador de linha.
+            line[sizeof(line) - 5] = '.';
+            line[sizeof(line) - 4] = '.';
+            line[sizeof(line) - 3] = '\r';
+            line[sizeof(line) - 2] = '\n';
+            line[sizeof(line) - 1] = '\0';
             len = sizeof(line) - 1;
         }
         DWORD written = 0;
@@ -200,16 +336,36 @@ static void Log(const char* msg) {
             g_logBytes += written;
         }
         if (g_logBytes > kMaxLogBytes) {
+            // Rotacao ciclica: move para .old e recomeca (sessoes longas vivas).
             CloseHandle(g_hLog);
             g_hLog = INVALID_HANDLE_VALUE;
-            g_logFull = 1;
+            wchar_t oldp[MAX_PATH] = {};
+            size_t plen = wcslen(g_logPath);
+            if (plen + 5 < MAX_PATH) {
+                memcpy(oldp, g_logPath, plen * sizeof(wchar_t));
+                static const wchar_t kOld[] = L".old";
+                memcpy(oldp + plen, kOld, sizeof(kOld));
+                DeleteFileW(oldp);
+                MoveFileExW(g_logPath, oldp, MOVEFILE_REPLACE_EXISTING);
+            }
+            g_hLog = CreateFileW(g_logPath, FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            g_logBytes = 0;
+            if (g_hLog == INVALID_HANDLE_VALUE) {
+                g_logFull = 1;
+            }
         }
     }
     ReleaseSRWLockExclusive(&g_logLock);
 }
 
 // So decrementa com orcamento positivo: falhas tardias continuam visiveis.
+// Nivel 2 registra tudo sem gastar.
 static bool TakeBudget(LONG* budget) {
+    if (g_logLevel >= 2) {
+        return true;
+    }
     if (InterlockedOr(budget, 0) <= 0) {
         return false;
     }
@@ -265,28 +421,54 @@ static bool ContainsInsensitiveWideAscii(const wchar_t* text, const wchar_t* nee
     return false;
 }
 
+static bool AnyAscii(LPCSTR text, const char* const* words, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (ContainsInsensitiveAscii(text, words[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool AnyWide(LPCWSTR text, const wchar_t* const* words, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (ContainsInsensitiveWideAscii(text, words[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool IsGpuCompatibilityWarningA(LPCSTR text, LPCSTR caption) {
-    bool body = text && ContainsInsensitiveAscii(text, "gpu") &&
-        (ContainsInsensitiveAscii(text, "compat") ||
-         ContainsInsensitiveAscii(text, "minimum") ||
-         ContainsInsensitiveAscii(text, "requisitos"));
-    bool head = caption && ContainsInsensitiveAscii(caption, "gpu") &&
-        (ContainsInsensitiveAscii(caption, "compat") ||
-         ContainsInsensitiveAscii(caption, "minimum") ||
-         ContainsInsensitiveAscii(caption, "requisitos"));
-    return body || head;
+    static const char* kGpu[] = {
+        "gpu", "video", "graphics", "grafico", "placa", "driver", "directx",
+    };
+    static const char* kWarn[] = {
+        "compat", "minimum", "minimo", "requisitos", "suport", "obsoleto",
+    };
+    const size_t kGpuN = sizeof(kGpu) / sizeof(kGpu[0]);
+    const size_t kWarnN = sizeof(kWarn) / sizeof(kWarn[0]);
+    if (text && AnyAscii(text, kGpu, kGpuN) && AnyAscii(text, kWarn, kWarnN)) {
+        return true;
+    }
+    return caption && AnyAscii(caption, kGpu, kGpuN) &&
+        AnyAscii(caption, kWarn, kWarnN);
 }
 
 static bool IsGpuCompatibilityWarningW(LPCWSTR text, LPCWSTR caption) {
-    bool body = text && ContainsInsensitiveWideAscii(text, L"gpu") &&
-        (ContainsInsensitiveWideAscii(text, L"compat") ||
-         ContainsInsensitiveWideAscii(text, L"minimum") ||
-         ContainsInsensitiveWideAscii(text, L"requisitos"));
-    bool head = caption && ContainsInsensitiveWideAscii(caption, L"gpu") &&
-        (ContainsInsensitiveWideAscii(caption, L"compat") ||
-         ContainsInsensitiveWideAscii(caption, L"minimum") ||
-         ContainsInsensitiveWideAscii(caption, L"requisitos"));
-    return body || head;
+    static const wchar_t* kGpu[] = {
+        L"gpu", L"video", L"graphics", L"grafico", L"placa", L"driver", L"directx",
+    };
+    static const wchar_t* kWarn[] = {
+        L"compat", L"minimum", L"minimo", L"requisitos", L"suport", L"obsoleto",
+    };
+    const size_t kGpuN = sizeof(kGpu) / sizeof(kGpu[0]);
+    const size_t kWarnN = sizeof(kWarn) / sizeof(kWarn[0]);
+    if (text && AnyWide(text, kGpu, kGpuN) && AnyWide(text, kWarn, kWarnN)) {
+        return true;
+    }
+    return caption && AnyWide(caption, kGpu, kGpuN) &&
+        AnyWide(caption, kWarn, kWarnN);
 }
 
 // Devolve o botao que o jogo espera para cada tipo: MB_YESNO espera IDYES/IDNO,
@@ -645,11 +827,46 @@ extern "C" FARPROC SpiderFixResolveProc(int idx) {
     return reinterpret_cast<FARPROC>(p);
 }
 
+static BOOL CALLBACK DetectGpuNeed(PINIT_ONCE, PVOID, PVOID*) {
+    g_needsFix = 1;
+    if (!LoadOriginalD3D12()) {
+        return TRUE;
+    }
+    void* tmp = nullptr;
+    if (FAILED(g_originalD3D12CreateDevice(nullptr,
+            D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), &tmp)) || !tmp) {
+        return TRUE;
+    }
+    IUnknown* unk = static_cast<IUnknown*>(tmp);
+    ID3D12Device* dev = nullptr;
+    if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&dev))) && dev) {
+        static const D3D_FEATURE_LEVEL kProbe[] = {
+            D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1,
+            D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+        };
+        D3D12_FEATURE_DATA_FEATURE_LEVELS q {};
+        q.NumFeatureLevels = 5;
+        q.pFeatureLevelsRequested = kProbe;
+        if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS,
+                &q, sizeof(q))) &&
+            q.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_1) {
+            g_needsFix = 0;
+        }
+        dev->Release();
+    }
+    unk->Release();
+    return TRUE;
+}
+
 // Resolve originais pela vtable do proprio objeto (leitura compartilhada barata).
 static void LookupOriginals(ID3D12Device* self,
-    CheckFeatureSupport_t* checkOut, CreateGraphicsPipelineState_t* psoOut) {
+    CheckFeatureSupport_t* checkOut, CreateGraphicsPipelineState_t* psoOut,
+    CreatePipelineState_t* streamOut, CreatePipelineLibrary_t* libOut) {
     *checkOut = nullptr;
     *psoOut = nullptr;
+    *streamOut = nullptr;
+    *libOut = nullptr;
     if (!self) {
         return;
     }
@@ -659,6 +876,8 @@ static void LookupOriginals(ID3D12Device* self,
         if (g_vhooks[i].vtable == vt) {
             *checkOut = g_vhooks[i].check;
             *psoOut = g_vhooks[i].pso;
+            *streamOut = g_vhooks[i].psoStream;
+            *libOut = g_vhooks[i].libCreate;
             break;
         }
     }
@@ -672,8 +891,10 @@ static HRESULT STDMETHODCALLTYPE HookedCheckFeatureSupport(
     UINT featureSupportDataSize
 ) {
     CheckFeatureSupport_t original = nullptr;
-    CreateGraphicsPipelineState_t ignored = nullptr;
-    LookupOriginals(self, &original, &ignored);
+    CreateGraphicsPipelineState_t ignoredPso = nullptr;
+    CreatePipelineState_t ignoredStream = nullptr;
+    CreatePipelineLibrary_t ignoredLib = nullptr;
+    LookupOriginals(self, &original, &ignoredPso, &ignoredStream, &ignoredLib);
     if (!original) {
         return E_FAIL;
     }
@@ -705,17 +926,23 @@ static HRESULT STDMETHODCALLTYPE HookedCheckFeatureSupport(
             return hr; // Erro do chamador: nao inventa dado.
         }
         bool wants12_0 = false;
+        D3D_FEATURE_LEVEL maxRequested = static_cast<D3D_FEATURE_LEVEL>(0);
         for (UINT i = 0; i < levels->NumFeatureLevels; ++i) {
-            if (levels->pFeatureLevelsRequested[i] == D3D_FEATURE_LEVEL_12_0) {
+            D3D_FEATURE_LEVEL lv = levels->pFeatureLevelsRequested[i];
+            if (lv == D3D_FEATURE_LEVEL_12_0) {
                 wants12_0 = true;
-                break;
+            }
+            if (lv > maxRequested) {
+                maxRequested = lv;
             }
         }
+        // Consulta unaria em 12_1: responde o melhor possivel (12_0).
+        bool unary12_1 = !wants12_0 && maxRequested == D3D_FEATURE_LEVEL_12_1;
         if (SUCCEEDED(hr)) {
             if (levels->MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_0) {
                 return hr; // Nativo ja serve: nao rebaixa 12_1/12_2.
             }
-            if (wants12_0) {
+            if (wants12_0 || unary12_1) {
                 levels->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
                 if (verbose) {
                     Log("Spoof: FEATURE_LEVELS -> 12_0");
@@ -724,7 +951,8 @@ static HRESULT STDMETHODCALLTYPE HookedCheckFeatureSupport(
             }
             return hr;
         }
-        if (hr == static_cast<HRESULT>(DXGI_ERROR_UNSUPPORTED) && wants12_0) {
+        if (hr == static_cast<HRESULT>(DXGI_ERROR_UNSUPPORTED) &&
+            (wants12_0 || unary12_1)) {
             levels->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
             if (verbose) {
                 Log("Spoof: FEATURE_LEVELS UNSUPPORTED -> 12_0");
@@ -747,15 +975,222 @@ static const char* TopologyTypeName(D3D12_PRIMITIVE_TOPOLOGY_TYPE type) {
     }
 }
 
+// ---- Stream desc (ID3D12Device2::CreatePipelineState, vtable 50) ----
+template<typename T> struct StreamSub {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+    T Data;
+};
+template<typename T> static size_t StreamDataOff() {
+    return (4 + alignof(T) - 1) & ~(alignof(T) - 1);
+}
+template<typename T> static size_t StreamTotal() {
+    return (StreamDataOff<T>() + sizeof(T) + 7) & ~size_t(7);
+}
+
+static bool StreamStride(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t,
+    size_t* stride, size_t* dataOff) {
+    switch (t) {
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+        *stride = StreamTotal<ID3D12RootSignature*>();
+        *dataOff = StreamDataOff<ID3D12RootSignature*>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        *stride = StreamTotal<D3D12_SHADER_BYTECODE>();
+        *dataOff = StreamDataOff<D3D12_SHADER_BYTECODE>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+        *stride = StreamTotal<D3D12_STREAM_OUTPUT_DESC>();
+        *dataOff = StreamDataOff<D3D12_STREAM_OUTPUT_DESC>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+        *stride = StreamTotal<D3D12_BLEND_DESC>();
+        *dataOff = StreamDataOff<D3D12_BLEND_DESC>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+        *stride = StreamTotal<UINT>();
+        *dataOff = StreamDataOff<UINT>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+        *stride = StreamTotal<D3D12_RASTERIZER_DESC>();
+        *dataOff = StreamDataOff<D3D12_RASTERIZER_DESC>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+        *stride = StreamTotal<D3D12_DEPTH_STENCIL_DESC>();
+        *dataOff = StreamDataOff<D3D12_DEPTH_STENCIL_DESC>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+        *stride = StreamTotal<D3D12_INPUT_LAYOUT_DESC>();
+        *dataOff = StreamDataOff<D3D12_INPUT_LAYOUT_DESC>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+        *stride = StreamTotal<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>();
+        *dataOff = StreamDataOff<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+        *stride = StreamTotal<D3D12_PRIMITIVE_TOPOLOGY_TYPE>();
+        *dataOff = StreamDataOff<D3D12_PRIMITIVE_TOPOLOGY_TYPE>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS:
+        *stride = StreamTotal<D3D12_RT_FORMAT_ARRAY>();
+        *dataOff = StreamDataOff<D3D12_RT_FORMAT_ARRAY>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+        *stride = StreamTotal<DXGI_FORMAT>();
+        *dataOff = StreamDataOff<DXGI_FORMAT>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
+        *stride = StreamTotal<DXGI_SAMPLE_DESC>();
+        *dataOff = StreamDataOff<DXGI_SAMPLE_DESC>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+        *stride = StreamTotal<UINT>();
+        *dataOff = StreamDataOff<UINT>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+        *stride = StreamTotal<D3D12_CACHED_PIPELINE_STATE>();
+        *dataOff = StreamDataOff<D3D12_CACHED_PIPELINE_STATE>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+        *stride = StreamTotal<D3D12_PIPELINE_STATE_FLAGS>();
+        *dataOff = StreamDataOff<D3D12_PIPELINE_STATE_FLAGS>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+        *stride = StreamTotal<D3D12_DEPTH_STENCIL_DESC1>();
+        *dataOff = StreamDataOff<D3D12_DEPTH_STENCIL_DESC1>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+        *stride = StreamTotal<D3D12_VIEW_INSTANCING_DESC>();
+        *dataOff = StreamDataOff<D3D12_VIEW_INSTANCING_DESC>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+        *stride = StreamTotal<D3D12_SHADER_BYTECODE>();
+        *dataOff = StreamDataOff<D3D12_SHADER_BYTECODE>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
+        *stride = StreamTotal<D3D12_DEPTH_STENCIL_DESC2>();
+        *dataOff = StreamDataOff<D3D12_DEPTH_STENCIL_DESC2>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
+        *stride = StreamTotal<D3D12_RASTERIZER_DESC1>();
+        *dataOff = StreamDataOff<D3D12_RASTERIZER_DESC1>();
+        return true;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2:
+        *stride = StreamTotal<D3D12_RASTERIZER_DESC2>();
+        *dataOff = StreamDataOff<D3D12_RASTERIZER_DESC2>();
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct StreamScan {
+    bool valid;
+    bool depthOnlyPs;
+    const D3D12_SHADER_BYTECODE* ps;
+};
+
+// Varredura fail-closed: qualquer layout fora do esperado aborta o retry.
+static StreamScan ScanStream(const void* stream, SIZE_T size) {
+    StreamScan r {};
+    if (!stream || size < 8 || size > 65536) {
+        return r;
+    }
+    const unsigned char* p = static_cast<const unsigned char*>(stream);
+    const unsigned char* end = p + size;
+    unsigned rtvCount = 0;
+    bool sawRtv = false;
+    DXGI_FORMAT dsv = DXGI_FORMAT_UNKNOWN;
+    bool sawDsv = false;
+    const D3D12_SHADER_BYTECODE* ps = nullptr;
+    while (p + 8 <= end) {
+        int ti = 0;
+        memcpy(&ti, p, 4);
+        if (ti < 0 || ti >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID) {
+            return r;
+        }
+        auto type = static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(ti);
+        size_t stride = 0;
+        size_t dataOff = 0;
+        if (!StreamStride(type, &stride, &dataOff) || !stride || p + stride > end) {
+            return r;
+        }
+        const unsigned char* data = p + dataOff;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+            ps = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(data);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+            auto* arr = reinterpret_cast<const D3D12_RT_FORMAT_ARRAY*>(data);
+            sawRtv = true;
+            rtvCount = 0;
+            for (int i = 0; i < 8; ++i) {
+                if (arr->RTFormats[i] != DXGI_FORMAT_UNKNOWN) {
+                    ++rtvCount;
+                }
+            }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
+            sawDsv = true;
+            memcpy(&dsv, data, sizeof(dsv));
+        }
+        p += stride;
+    }
+    if (p != end) {
+        return r;
+    }
+    r.valid = true;
+    r.depthOnlyPs = sawRtv && rtvCount == 0 && sawDsv && dsv != DXGI_FORMAT_UNKNOWN &&
+        ps && ps->pShaderBytecode && ps->BytecodeLength > 0;
+    r.ps = ps;
+    return r;
+}
+
+// Recopia o stream sem o subobjeto PS. Devolve false se nao couber ou falhar.
+static bool BuildStreamWithoutPs(const void* stream, SIZE_T size,
+    unsigned char* out, SIZE_T outCap, SIZE_T* outSize) {
+    const unsigned char* p = static_cast<const unsigned char*>(stream);
+    const unsigned char* end = p + size;
+    SIZE_T used = 0;
+    while (p + 8 <= end) {
+        int ti = 0;
+        memcpy(&ti, p, 4);
+        auto type = static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(ti);
+        size_t stride = 0;
+        size_t dataOff = 0;
+        (void)dataOff;
+        if (!StreamStride(type, &stride, &dataOff) || !stride || p + stride > end) {
+            return false;
+        }
+        if (type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+            if (used + stride > outCap) {
+                return false;
+            }
+            memcpy(out + used, p, stride);
+            used += stride;
+        }
+        p += stride;
+    }
+    if (p != end) {
+        return false;
+    }
+    *outSize = used;
+    return true;
+}
+
 static HRESULT STDMETHODCALLTYPE HookedCreateGraphicsPipelineState(
     ID3D12Device* self,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
     REFIID riid,
     void** ppPipelineState
 ) {
-    CheckFeatureSupport_t ignored = nullptr;
+    CheckFeatureSupport_t ignoredCheck = nullptr;
     CreateGraphicsPipelineState_t original = nullptr;
-    LookupOriginals(self, &ignored, &original);
+    CreatePipelineState_t ignoredStream = nullptr;
+    CreatePipelineLibrary_t ignoredLib = nullptr;
+    LookupOriginals(self, &ignoredCheck, &original, &ignoredStream, &ignoredLib);
     if (!original) {
         return E_FAIL;
     }
@@ -843,6 +1278,240 @@ static HRESULT STDMETHODCALLTYPE HookedCreateGraphicsPipelineState(
     return hr;
 }
 
+static HRESULT STDMETHODCALLTYPE HookedCreatePipelineStateStream(
+    ID3D12Device2* self,
+    const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+    REFIID riid,
+    void** ppPipelineState
+) {
+    CheckFeatureSupport_t ignoredCheck = nullptr;
+    CreateGraphicsPipelineState_t ignoredPso = nullptr;
+    CreatePipelineState_t original = nullptr;
+    CreatePipelineLibrary_t ignoredLib = nullptr;
+    LookupOriginals(static_cast<ID3D12Device*>(self),
+        &ignoredCheck, &ignoredPso, &original, &ignoredLib);
+    if (!original) {
+        return E_FAIL;
+    }
+
+    HRESULT hr = original(self, desc, riid, ppPipelineState);
+    if (g_depthRetry == 1 && hr == E_INVALIDARG && desc &&
+        desc->pPipelineStateSubobjectStream && desc->SizeInBytes > 0) {
+        StreamScan s = ScanStream(
+            desc->pPipelineStateSubobjectStream, desc->SizeInBytes);
+        if (s.valid && s.depthOnlyPs) {
+            unsigned char buf[4096] = {};
+            SIZE_T outSize = 0;
+            if (BuildStreamWithoutPs(desc->pPipelineStateSubobjectStream,
+                    desc->SizeInBytes, buf, sizeof(buf), &outSize)) {
+                D3D12_PIPELINE_STATE_STREAM_DESC patched = *desc;
+                patched.pPipelineStateSubobjectStream = buf;
+                patched.SizeInBytes = outSize;
+                HRESULT retryHr = original(self, &patched, riid, ppPipelineState);
+                if (TakeBudget(&g_psoFailureLogBudget)) {
+                    char retryBuf[256] {};
+                    std::snprintf(retryBuf, sizeof(retryBuf),
+                        "Stream PSO retry without PS: original 0x%08lX retry 0x%08lX PS=%zu(hash 0x%08X)",
+                        static_cast<unsigned long>(hr),
+                        static_cast<unsigned long>(retryHr),
+                        s.ps->BytecodeLength,
+                        Fnv1a(s.ps->pShaderBytecode, s.ps->BytecodeLength));
+                    Log(retryBuf);
+                }
+                if (SUCCEEDED(retryHr)) {
+                    return retryHr;
+                }
+            }
+        }
+    }
+    if (FAILED(hr) && TakeBudget(&g_psoFailureLogBudget)) {
+        char buf[256] {};
+        std::snprintf(buf, sizeof(buf),
+            "CreatePipelineState(stream) failed 0x%08lX size=%zu",
+            static_cast<unsigned long>(hr),
+            desc ? static_cast<size_t>(desc->SizeInBytes) : 0);
+        Log(buf);
+    }
+    return hr;
+}
+
+// Wrapper de ID3D12PipelineLibrary1: repassa tudo, retenta LoadGraphicsPipeline
+// e LoadPipeline (stream) depth-only sem PS. Refcount espelha o real.
+class PipelineLibraryHook : public ID3D12PipelineLibrary1 {
+    ID3D12PipelineLibrary* m_real;
+    bool m_stream;
+
+    PipelineLibraryHook(ID3D12PipelineLibrary* real, bool stream)
+        : m_real(real), m_stream(stream) {
+    }
+
+public:
+    static PipelineLibraryHook* Create(ID3D12PipelineLibrary* real, bool stream) {
+        void* mem = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PipelineLibraryHook));
+        if (!mem) {
+            return nullptr;
+        }
+        return new (mem) PipelineLibraryHook(real, stream);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override {
+        if (!pp) {
+            return E_POINTER;
+        }
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12DeviceChild) ||
+            riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12PipelineLibrary) ||
+            riid == __uuidof(ID3D12PipelineLibrary1)) {
+            *pp = static_cast<ID3D12PipelineLibrary1*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return m_real->QueryInterface(riid, pp);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return m_real->AddRef();
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG c = m_real->Release();
+        if (c == 0) {
+            this->~PipelineLibraryHook();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return c;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
+        return m_real->GetPrivateData(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
+        return m_real->SetPrivateData(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* data) override {
+        return m_real->SetPrivateDataInterface(guid, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override {
+        return m_real->SetName(name);
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** pp) override {
+        return m_real->GetDevice(riid, pp);
+    }
+    HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pipe) override {
+        return m_real->StorePipeline(name, pipe);
+    }
+    HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp) override {
+        return m_real->LoadComputePipeline(name, desc, riid, pp);
+    }
+    HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp) override {
+        HRESULT hr = m_real->LoadGraphicsPipeline(name, desc, riid, pp);
+        if (g_depthRetry == 1 && hr == E_INVALIDARG && desc &&
+            desc->NumRenderTargets == 0 &&
+            desc->DSVFormat != DXGI_FORMAT_UNKNOWN &&
+            desc->PS.pShaderBytecode && desc->PS.BytecodeLength > 0) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC patched = *desc;
+            patched.PS = {};
+            HRESULT retryHr = m_real->LoadGraphicsPipeline(name, &patched, riid, pp);
+            if (TakeBudget(&g_psoFailureLogBudget)) {
+                char buf[256] {};
+                std::snprintf(buf, sizeof(buf),
+                    "Library LoadGraphicsPipeline retry without PS: original 0x%08lX retry 0x%08lX",
+                    static_cast<unsigned long>(hr),
+                    static_cast<unsigned long>(retryHr));
+                Log(buf);
+            }
+            if (SUCCEEDED(retryHr)) {
+                return retryHr;
+            }
+        }
+        return hr;
+    }
+    SIZE_T STDMETHODCALLTYPE GetSerializedSize() override {
+        return m_real->GetSerializedSize();
+    }
+    HRESULT STDMETHODCALLTYPE Serialize(void* data, SIZE_T size) override {
+        return m_real->Serialize(data, size);
+    }
+    HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name,
+        const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pp) override {
+        if (!m_stream) {
+            return E_NOINTERFACE;
+        }
+        ID3D12PipelineLibrary1* lib1 = nullptr;
+        if (FAILED(m_real->QueryInterface(__uuidof(ID3D12PipelineLibrary1),
+                reinterpret_cast<void**>(&lib1))) || !lib1) {
+            return E_NOINTERFACE;
+        }
+        HRESULT hr = lib1->LoadPipeline(name, desc, riid, pp);
+        if (g_depthRetry == 1 && hr == E_INVALIDARG && desc &&
+            desc->pPipelineStateSubobjectStream && desc->SizeInBytes > 0) {
+            StreamScan s = ScanStream(
+                desc->pPipelineStateSubobjectStream, desc->SizeInBytes);
+            if (s.valid && s.depthOnlyPs) {
+                unsigned char buf[4096] = {};
+                SIZE_T outSize = 0;
+                if (BuildStreamWithoutPs(desc->pPipelineStateSubobjectStream,
+                        desc->SizeInBytes, buf, sizeof(buf), &outSize)) {
+                    D3D12_PIPELINE_STATE_STREAM_DESC patched = *desc;
+                    patched.pPipelineStateSubobjectStream = buf;
+                    patched.SizeInBytes = outSize;
+                    HRESULT retryHr = lib1->LoadPipeline(name, &patched, riid, pp);
+                    if (TakeBudget(&g_psoFailureLogBudget)) {
+                        char retryBuf[256] {};
+                        std::snprintf(retryBuf, sizeof(retryBuf),
+                            "Library LoadPipeline retry without PS: original 0x%08lX retry 0x%08lX",
+                            static_cast<unsigned long>(hr),
+                            static_cast<unsigned long>(retryHr));
+                        Log(retryBuf);
+                    }
+                    if (SUCCEEDED(retryHr)) {
+                        lib1->Release();
+                        return retryHr;
+                    }
+                }
+            }
+        }
+        lib1->Release();
+        return hr;
+    }
+};
+
+static HRESULT STDMETHODCALLTYPE HookedCreatePipelineLibrary(
+    ID3D12Device* self,
+    const void* blob,
+    SIZE_T blobLen,
+    REFIID riid,
+    void** ppPipelineLibrary
+) {
+    CheckFeatureSupport_t ignoredCheck = nullptr;
+    CreateGraphicsPipelineState_t ignoredPso = nullptr;
+    CreatePipelineState_t ignoredStream = nullptr;
+    CreatePipelineLibrary_t original = nullptr;
+    LookupOriginals(self, &ignoredCheck, &ignoredPso, &ignoredStream, &original);
+    if (!original) {
+        return E_FAIL;
+    }
+
+    HRESULT hr = original(self, blob, blobLen, riid, ppPipelineLibrary);
+    if (SUCCEEDED(hr) && ppPipelineLibrary && *ppPipelineLibrary && g_hookLib == 1) {
+        ID3D12PipelineLibrary* real =
+            static_cast<ID3D12PipelineLibrary*>(*ppPipelineLibrary);
+        ID3D12PipelineLibrary1* lib1 = nullptr;
+        bool stream = SUCCEEDED(real->QueryInterface(
+            __uuidof(ID3D12PipelineLibrary1),
+            reinterpret_cast<void**>(&lib1)));
+        if (lib1) {
+            lib1->Release();
+        }
+        PipelineLibraryHook* wrapped = PipelineLibraryHook::Create(real, stream);
+        if (wrapped) {
+            *ppPipelineLibrary = wrapped;
+            if (TakeBudget(&g_featureLogBudget)) {
+                Log("PipelineLibrary encapsulada para retry depth-only");
+            }
+        }
+    }
+    return hr;
+}
+
 static void PatchDeviceMethods(IUnknown* deviceUnknown) {
     if (!deviceUnknown) {
         return;
@@ -856,8 +1525,32 @@ static void PatchDeviceMethods(IUnknown* deviceUnknown) {
     }
 
     void** vtable = *reinterpret_cast<void***>(device);
+    bool wantStream = false;
+    bool wantLibrary = (g_hookLib == 1);
+    ID3D12Device2* dev2 = nullptr;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D12Device2),
+            reinterpret_cast<void**>(&dev2))) && dev2) {
+        wantStream = true;
+        dev2->Release();
+    } else if (g_hookLib == 1) {
+        ID3D12Device1* dev1 = nullptr;
+        if (FAILED(device->QueryInterface(__uuidof(ID3D12Device1),
+                reinterpret_cast<void**>(&dev1))) || !dev1) {
+            wantLibrary = false;
+        } else {
+            dev1->Release();
+        }
+    } else {
+        wantLibrary = false;
+    }
+    size_t maxIdx = kCheckFeatureSupportVtableIndex;
+    if (wantStream) {
+        maxIdx = kCreatePipelineStateVtableIndex;
+    } else if (wantLibrary) {
+        maxIdx = kCreatePipelineLibraryVtableIndex;
+    }
     MEMORY_BASIC_INFORMATION mbi {};
-    SIZE_T need = sizeof(void*) * (kCheckFeatureSupportVtableIndex + 1);
+    SIZE_T need = sizeof(void*) * (maxIdx + 1);
     if (!vtable || VirtualQuery(vtable, &mbi, sizeof(mbi)) < sizeof(mbi) ||
         mbi.State != MEM_COMMIT || mbi.Protect == PAGE_NOACCESS ||
         (reinterpret_cast<char*>(vtable) + need >
@@ -869,7 +1562,11 @@ static void PatchDeviceMethods(IUnknown* deviceUnknown) {
     if (vtable[kCheckFeatureSupportVtableIndex] ==
             reinterpret_cast<void*>(&HookedCheckFeatureSupport) &&
         vtable[kCreateGraphicsPipelineStateVtableIndex] ==
-            reinterpret_cast<void*>(&HookedCreateGraphicsPipelineState)) {
+            reinterpret_cast<void*>(&HookedCreateGraphicsPipelineState) &&
+        (!wantStream || vtable[kCreatePipelineStateVtableIndex] ==
+            reinterpret_cast<void*>(&HookedCreatePipelineStateStream)) &&
+        (!wantLibrary || vtable[kCreatePipelineLibraryVtableIndex] ==
+            reinterpret_cast<void*>(&HookedCreatePipelineLibrary))) {
         device->Release();
         return; // Ja hookado por outro device da mesma vtable.
     }
@@ -894,21 +1591,43 @@ static void PatchDeviceMethods(IUnknown* deviceUnknown) {
             reinterpret_cast<CheckFeatureSupport_t>(vtable[kCheckFeatureSupportVtableIndex]);
         CreateGraphicsPipelineState_t origPso =
             reinterpret_cast<CreateGraphicsPipelineState_t>(vtable[kCreateGraphicsPipelineStateVtableIndex]);
+        CreatePipelineState_t origStream = nullptr;
+        CreatePipelineLibrary_t origLib = nullptr;
+        if (wantStream) {
+            origStream = reinterpret_cast<CreatePipelineState_t>(
+                vtable[kCreatePipelineStateVtableIndex]);
+        }
+        if (wantLibrary) {
+            origLib = reinterpret_cast<CreatePipelineLibrary_t>(
+                vtable[kCreatePipelineLibraryVtableIndex]);
+        }
         DWORD oldProtect = 0;
-        SIZE_T range = sizeof(void*) *
-            (kCheckFeatureSupportVtableIndex - kCreateGraphicsPipelineStateVtableIndex + 1);
+        SIZE_T range = sizeof(void*) * (maxIdx - kCreateGraphicsPipelineStateVtableIndex + 1);
         if (VirtualProtect(&vtable[kCreateGraphicsPipelineStateVtableIndex],
                 range, PAGE_READWRITE, &oldProtect)) {
             vtable[kCreateGraphicsPipelineStateVtableIndex] =
                 reinterpret_cast<void*>(&HookedCreateGraphicsPipelineState);
             vtable[kCheckFeatureSupportVtableIndex] =
                 reinterpret_cast<void*>(&HookedCheckFeatureSupport);
+            if (wantStream) {
+                vtable[kCreatePipelineStateVtableIndex] =
+                    reinterpret_cast<void*>(&HookedCreatePipelineStateStream);
+            }
+            if (wantLibrary) {
+                vtable[kCreatePipelineLibraryVtableIndex] =
+                    reinterpret_cast<void*>(&HookedCreatePipelineLibrary);
+            }
             DWORD ignored = 0;
             VirtualProtect(&vtable[kCreateGraphicsPipelineStateVtableIndex],
                 range, oldProtect, &ignored);
+            // Inofensivo em x86 (icache coerente); exigencia de auditoria.
+            FlushInstructionCache(GetCurrentProcess(),
+                &vtable[kCreateGraphicsPipelineStateVtableIndex], range);
             g_vhooks[g_vhookCount].vtable = vtable;
             g_vhooks[g_vhookCount].check = origCheck;
             g_vhooks[g_vhookCount].pso = origPso;
+            g_vhooks[g_vhookCount].psoStream = origStream;
+            g_vhooks[g_vhookCount].libCreate = origLib;
             ++g_vhookCount;
             patched = true;
             HMODULE pinned = nullptr; // Fixa modulo: vtable apontaria p/ codigo descarregado.
@@ -923,11 +1642,67 @@ static void PatchDeviceMethods(IUnknown* deviceUnknown) {
     device->Release();
 
     if (patched) {
-        Log("Patch aplicado: ID3D12Device::CreateGraphicsPipelineState + CheckFeatureSupport");
+        Log("Patch aplicado: ID3D12Device + Device1/Device2");
     } else if (tableFull) {
         Log("Tabela de vtables cheia, patch ignorado");
     } else if (protFail) {
         Log("VirtualProtect falhou ao patchar metodos do ID3D12Device");
+    }
+}
+
+static LONG s_osdShown = 0;
+static ATOM s_osdAtom = 0;
+
+// Aviso visual de 4s, sem roubar foco (NOACTIVATE), em thread propria.
+static DWORD WINAPI OsdThread(LPVOID param) {
+    int mode = static_cast<int>(reinterpret_cast<INT_PTR>(param));
+    const wchar_t* text = (mode == 0) ?
+        L"SpiderFix ativo - modo BYPASS (GPU 12_1+)" :
+        L"SpiderFix ativo - modo FIX (GPU 12_0)";
+    static const wchar_t kCls[] = L"SpiderFixOsd";
+    HMODULE inst = GetModuleHandleW(nullptr);
+    if (!s_osdAtom) {
+        WNDCLASSEXW wc {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = inst;
+        wc.lpszClassName = kCls;
+        s_osdAtom = RegisterClassExW(&wc);
+    }
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    HWND w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        kCls, text, WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        (sw > 420 ? sw - 420 : 0), (sh > 140 ? sh - 140 : 0),
+        400, 80, nullptr, nullptr, inst, nullptr);
+    if (!w) {
+        return 0;
+    }
+    ShowWindow(w, SW_SHOWNOACTIVATE);
+    SetTimer(w, 1, 4000, nullptr);
+    MSG msg {};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_TIMER) {
+            break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    DestroyWindow(w);
+    return 0;
+}
+
+static void ShowOsdOnce(int mode) {
+    if (g_showOsd != 1) {
+        return;
+    }
+    if (InterlockedCompareExchange(&s_osdShown, 1, 0) != 0) {
+        return;
+    }
+    HANDLE th = CreateThread(nullptr, 0, OsdThread,
+        reinterpret_cast<LPVOID>(static_cast<INT_PTR>(mode)), 0, nullptr);
+    if (th) {
+        CloseHandle(th);
     }
 }
 
@@ -951,9 +1726,9 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
         return E_FAIL;
     }
 
-    // Detecta GPU capaz uma vez: cria device temporario em 11_0 e le o nivel
-    // nativo. 12_1+ ignora o fix (passthrough puro, sem hooks). 12_0 ou menos
-    // segue o caminho do fix. SPIDERFIX_FORCE=1 forca o fix em qualquer GPU.
+    // Detecta GPU capaz uma unica vez: 12_1+ ignora o fix (passthrough puro,
+    // sem hooks). 12_0 ou menos segue o caminho do fix. SPIDERFIX_FORCE=1
+    // forca o fix em qualquer GPU.
     static LONG s_force = -1;
     if (s_force == -1) {
         char v[8] {};
@@ -962,39 +1737,16 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
             (n > 0 && (v[0] == '1' || v[0] == 'Y' || v[0] == 'y')) ? 1 : 0);
     }
     if (s_force == 0) {
-        void* tmp = nullptr;
-        HRESULT tmpHr = g_originalD3D12CreateDevice(pAdapter,
-            D3D_FEATURE_LEVEL_11_0, riid, &tmp);
-        if (SUCCEEDED(tmpHr) && tmp) {
-            IUnknown* unk = static_cast<IUnknown*>(tmp);
-            ID3D12Device* dev = nullptr;
-            if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&dev))) && dev) {
-                static const D3D_FEATURE_LEVEL kProbe[] = {
-                    D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1,
-                    D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
-                    D3D_FEATURE_LEVEL_11_0,
-                };
-                D3D12_FEATURE_DATA_FEATURE_LEVELS q {};
-                q.NumFeatureLevels = 5;
-                q.pFeatureLevelsRequested = kProbe;
-                if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS,
-                        &q, sizeof(q))) &&
-                    q.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_1) {
-                    char cap[128] {};
-                    std::snprintf(cap, sizeof(cap),
-                        "GPU nativa %s: bypass, fix ignorado",
-                        FeatureLevelName(q.MaxSupportedFeatureLevel));
-                    Log(cap);
-                    dev->Release();
-                    unk->Release();
-                    return g_originalD3D12CreateDevice(
-                        pAdapter, minimumFeatureLevel, riid, ppDevice);
-                }
-                dev->Release();
-            }
-            unk->Release();
+        PVOID dctx = nullptr;
+        InitOnceExecuteOnce(&g_detectOnce, DetectGpuNeed, nullptr, &dctx);
+        if (g_needsFix == 0) {
+            Log("GPU nativa 12_1+: bypass, fix ignorado");
+            ShowOsdOnce(0);
+            return g_originalD3D12CreateDevice(
+                pAdapter, minimumFeatureLevel, riid, ppDevice);
         }
     }
+    ShowOsdOnce(1);
 
     EnsureMsgboxPatch();
 

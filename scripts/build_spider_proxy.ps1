@@ -13,11 +13,13 @@ $OutDir = Join-Path $Repo "release"
 $Src = Join-Path $SrcDir "SpiderD3D12Proxy.cpp"
 $Asm = Join-Path $SrcDir "D3D12ProxyStubs.asm"
 $Def = Join-Path $SrcDir "d3d12_proxy.def"
+$Rc = Join-Path $SrcDir "spiderfix.rc"
 $Out = Join-Path $OutDir "d3d12.dll"
 $Obj = Join-Path $OutDir "D3D12Proxy.obj"
 $AsmObj = Join-Path $OutDir "D3D12ProxyStubs.obj"
+$ResObj = Join-Path $OutDir "spiderfix.res"
 
-foreach ($f in @($Src, $Asm, $Def)) {
+foreach ($f in @($Src, $Asm, $Def, $Rc)) {
     if (!(Test-Path -LiteralPath $f)) { throw "Nao encontrei: $f" }
 }
 
@@ -42,8 +44,9 @@ foreach ($c in @(
 
 $clArgs = @("/nologo", "/EHsc", "/std:c++17", "/O2", "/MT", "/W4", "/permissive-",
     "/Zi", "/guard:cf", "/DNDEBUG", "/DWIN32_LEAN_AND_MEAN", "/LD",
-    $Src, $AsmObj, "/Fe:$Out", "/Fo:$Obj",
-    "/link", "/DEF:$Def", "/DEBUG", "/OPT:REF", "/OPT:ICF", "/GUARD:CF", "/MACHINE:X64")
+    $Src, $AsmObj, $ResObj, "/Fe:$Out", "/Fo:$Obj",
+    "/link", "/DEF:$Def", "/DEBUG", "/OPT:REF", "/OPT:ICF", "/GUARD:CF", "/MACHINE:X64",
+    "user32.lib")
 
 if ($vcvars) {
     # Importa o ambiente do vcvars via .cmd temporario (quotacao estavel no PS 5.1 e 7+).
@@ -64,7 +67,7 @@ if ($vcvars) {
     throw "Ambiente de build aponta para $($env:VSCMD_ARG_TGT_ARCH), precisa de x64 (Developer PowerShell x64)."
 }
 
-foreach ($t in @("cl.exe", "ml64.exe", "link.exe")) {
+foreach ($t in @("cl.exe", "ml64.exe", "link.exe", "rc.exe")) {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) {
         throw "$t nao encontrado. Rode via Developer PowerShell x64 ou instale MSVC x64 + SDK."
     }
@@ -72,6 +75,9 @@ foreach ($t in @("cl.exe", "ml64.exe", "link.exe")) {
 
 & ml64.exe /nologo /Zi /c /Fo $AsmObj $Asm
 if ($LASTEXITCODE -ne 0) { throw "ml64 falhou: $LASTEXITCODE" }
+
+& rc.exe /nologo /fo $ResObj $Rc
+if ($LASTEXITCODE -ne 0) { throw "rc falhou: $LASTEXITCODE" }
 
 & cl.exe @clArgs
 if ($LASTEXITCODE -ne 0) { throw "cl falhou: $LASTEXITCODE" }

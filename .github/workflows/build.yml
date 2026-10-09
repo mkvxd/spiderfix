@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build proxy
+        shell: powershell
+        run: .\scripts\build_spider_proxy.ps1
+
+      - name: Check exports
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = dumpbin /exports release\d3d12.dll | Out-String
+          foreach ($n in @("D3D12CreateDevice", "D3D12GetInterface", "SpiderFixVersion")) {
+            if ($out -notmatch $n) { throw "Export ausente: $n" }
+          }
+          Write-Output "Exports OK"
+
+      - name: Run installer tests
+        shell: powershell
+        run: .\tests\test_install.ps1
+
+      - name: Run smoke test
+        shell: powershell
+        run: .\tests\smoke_test.ps1
+
+      - name: Pack release
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "spiderfix.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -LiteralPath @(
+            "release\d3d12.dll",
+            "scripts\install_fix.ps1",
+            "scripts\uninstall_fix.ps1",
+            "README.md",
+            "README_EN.md"
+          ) -DestinationPath $zip
+          (Get-FileHash $zip -Algorithm SHA256).Hash + "  $zip" |
+            Set-Content "SHA256SUMS.txt" -Encoding Ascii
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spiderfix
+          path: |
+            spiderfix.zip
+            SHA256SUMS.txt

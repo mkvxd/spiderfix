@@ -42,6 +42,14 @@ O uninstall restaura o backup e limpa as pastas criadas. Ele recusa apagar `d3d1
 | `SPIDERFIX_LOG=0` | Desliga o log em `spiderfix.log` |
 | `SPIDERFIX_DEPTH_RETRY=0` | Desliga o retry depth-only (o jogo trava sem ele) |
 
+O arquivo `spiderfix.ini` (veja `spiderfix.ini.example`) ao lado da DLL ajusta o mesmo sem variável: `Log`, `LogLevel`, `ForceActive`, `DepthRetry`, `HookPipelineLibrary`, `ShowOSD`.
+
+A primeira abertura mostra aviso SpiderFix por 4 segundos (`ShowOSD=0` desliga).
+
+## Interface gráfica
+
+`scripts\SpiderFixGUI.ps1` abre janela com instalar, desinstalar, alternar `cache.pso` e exportar diagnóstico para a Área de Trabalho.
+
 ## Compilação
 
 ```powershell
