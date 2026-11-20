@@ -1,12 +1,32 @@
 #Requires -Version 5.1
 # Smoke test da DLL: carrega copia isolada, chama SpiderFixVersion e
 # D3D12CreateDevice, confere log. Exige GPU D3D12 (WARP serve).
+# Roda duas vezes em processo filho: padrao e SPIDERFIX_FORCE=1 (caminho do fix,
+# que GPU 12_1+ do CI pularia). Processo separado porque s_force e os patches de
+# vtable sobrevivem ao FreeLibrary.
 # Uso: powershell -ExecutionPolicy Bypass -File tests/smoke_test.ps1
 
 [CmdletBinding()]
-param()
+param([switch]$Child)
 
 $ErrorActionPreference = "Stop"
+
+if (-not $Child) {
+    $hadForce = Test-Path Env:\SPIDERFIX_FORCE
+    $oldForce = $env:SPIDERFIX_FORCE
+    try {
+        foreach ($force in @($null, "1")) {
+            if ($force) { $env:SPIDERFIX_FORCE = $force } else { Remove-Item Env:\SPIDERFIX_FORCE -ErrorAction SilentlyContinue }
+            Write-Output ("== SPIDERFIX_FORCE=" + $(if ($force) { $force } else { "(vazio)" }))
+            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Child
+            if ($LASTEXITCODE -ne 0) { throw "Smoke test falhou (SPIDERFIX_FORCE=$force): $LASTEXITCODE" }
+        }
+    } finally {
+        if ($hadForce) { $env:SPIDERFIX_FORCE = $oldForce } else { Remove-Item Env:\SPIDERFIX_FORCE -ErrorAction SilentlyContinue }
+    }
+    Write-Output "Smoke test passou."
+    return
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $releaseDll = Join-Path $repoRoot "release\d3d12.dll"
@@ -70,9 +90,19 @@ public static class H {
     } finally {
         [H]::FreeLibrary($h) | Out-Null
     }
+    if ($env:SPIDERFIX_FORCE -eq "1") {
+        # FileShare ReadWrite: a DLL pode manter o handle do log aberto.
+        $fs = [System.IO.File]::Open($log, "Open", "Read", "ReadWrite")
+        try { $text = (New-Object System.IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+        foreach ($m in @("D3D12CreateDevice liberado pelo proxy", "Patch aplicado")) {
+            if ($text -notmatch [regex]::Escape($m)) {
+                throw "Modo forcado sem evidencia do fix no log: '$m'"
+            }
+        }
+        Write-Output "PASS: caminho do fix no log (forcado)"
+    }
 } finally {
     Remove-Item Env:\SPIDERFIX_LOG -ErrorAction SilentlyContinue
     Remove-Item Env:\SPIDERFIX_OSD -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
-Write-Output "Smoke test passou."

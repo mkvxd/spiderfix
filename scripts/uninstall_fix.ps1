@@ -1,35 +1,25 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [Parameter(Mandatory = $true)]
     [string]$GamePath
 )
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "SpiderFixCommon.ps1")
+
+if (!$GamePath) {
+    # Sem -GamePath: tenta achar o jogo (Steam/Epic).
+    $GamePath = Find-SpiderManPath
+    if (!$GamePath) {
+        throw "Pasta do jogo nao encontrada automaticamente. Use -GamePath."
+    }
+    Write-Host "Pasta do jogo detectada: $GamePath"
+}
 $GamePath = (Resolve-Path -LiteralPath $GamePath).ProviderPath
 $target = Join-Path $GamePath "d3d12.dll"
 $cacheDisabled = Join-Path $GamePath "cache.pso.disabled"
 $cache = Join-Path $GamePath "cache.pso"
 $gameLog = Join-Path $GamePath "spiderfix.log"
-
-function Test-AdminWrite([string]$Dir) {
-    try {
-        $t = Join-Path $Dir ".spiderfix_write_test"
-        [System.IO.File]::WriteAllText($t, "x")
-        [System.IO.File]::Delete($t) # .NET: funciona mesmo em -WhatIf.
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-function Test-SpiderFixDll([string]$Path) {
-    try {
-        return ((Get-Item -LiteralPath $Path).VersionInfo.ProductName -eq "SpiderFix")
-    } catch {
-        return $false
-    }
-}
 
 $proc = Get-Process -Name "Spider-Man2" -ErrorAction SilentlyContinue
 if ($proc) {
@@ -38,19 +28,23 @@ if ($proc) {
 
 if (!(Test-AdminWrite $GamePath)) {
     Write-Host "Sem escrita em $GamePath. Relancando como administrador..."
-    Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`" -GamePath `"$GamePath`""
-    exit 0
+    exit (Invoke-SpiderFixElevated $PSCommandPath $GamePath $PSBoundParameters.ContainsKey("WhatIf"))
 }
 
-# Backup fixo primeiro, depois timestampados por nome (timestamp esta no nome).
+# Timestampados primeiro (mais novo antes, timestamp esta no nome), backup fixo por ultimo.
 $fixed = Join-Path $GamePath "SpiderFixBackup_original"
-$candidates = @()
+$candidates = @(Get-ChildItem -LiteralPath $GamePath -Filter "SpiderFixBackup_*" -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -ne $fixed } |
+    Sort-Object Name -Descending)
 if (Test-Path -LiteralPath $fixed) {
     $candidates += Get-Item -LiteralPath $fixed
 }
-$candidates += Get-ChildItem -LiteralPath $GamePath -Filter "SpiderFixBackup_*" -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -ne $fixed } |
-    Sort-Object Name -Descending
+
+# Se a d3d12.dll atual nao e a proxy (outro mod por cima), nao restaura nem remove.
+$foreign = (Test-Path -LiteralPath $target) -and -not (Test-SpiderFixDll $target)
+if ($foreign) {
+    $candidates = @()
+}
 
 $restored = $false
 foreach ($b in $candidates) {
@@ -84,9 +78,9 @@ foreach ($b in $candidates) {
 if (-not $restored) {
     if (Test-Path -LiteralPath $target) {
         $refuse = $false
-        if (-not (Test-SpiderFixDll $target)) {
-            # Pode ser outro mod (OptiScaler, ReShade): nao apaga.
-            Write-Warning "d3d12.dll atual nao e a proxy e nao ha backup. Remocao recusada."
+        if ($foreign) {
+            # Pode ser outro mod (OptiScaler, ReShade): nao apaga nem sobrescreve.
+            Write-Warning "d3d12.dll atual nao e a proxy (outro mod?). Restauracao/remocao recusada."
             $refuse = $true
         }
         if (-not $refuse) {
@@ -107,13 +101,17 @@ if ((Test-Path -LiteralPath $cacheDisabled) -and !(Test-Path -LiteralPath $cache
     Write-Host "cache.pso restaurado."
 }
 
-# Limpeza: pastas de backup deste fix e log do proxy.
-Get-ChildItem -LiteralPath $GamePath -Filter "SpiderFixBackup_*" -Directory -ErrorAction SilentlyContinue |
-    ForEach-Object {
+# Limpeza: pastas de backup so se restaurou; senao mantem (original pode estar nelas).
+$backups = @(Get-ChildItem -LiteralPath $GamePath -Filter "SpiderFixBackup_*" -Directory -ErrorAction SilentlyContinue)
+if ($restored) {
+    $backups | ForEach-Object {
         if ($PSCmdlet.ShouldProcess($_.FullName, "Remover pasta de backup")) {
             Remove-Item -LiteralPath $_.FullName -Recurse -Force
         }
     }
+} elseif ($backups.Count -gt 0) {
+    Write-Warning ("Backup(s) nao restaurado(s), mantidos em:`n" + (($backups | ForEach-Object { $_.FullName }) -join "`n"))
+}
 if (Test-Path -LiteralPath $gameLog) {
     if ($PSCmdlet.ShouldProcess($gameLog, "Remover log do proxy")) {
         Remove-Item -LiteralPath $gameLog -Force

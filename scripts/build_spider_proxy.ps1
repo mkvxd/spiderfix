@@ -26,11 +26,13 @@ foreach ($f in @($Src, $Asm, $Def, $Rc)) {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 $vcvars = $null
+$vswhereDir = $null
 foreach ($c in @(
     "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
     "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
 )) {
     if (Test-Path -LiteralPath $c) {
+        $vswhereDir = Split-Path -Parent $c
         $vsPath = & $c -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
         if ($vsPath) {
             $candidate = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
@@ -43,15 +45,17 @@ foreach ($c in @(
 }
 
 $clArgs = @("/nologo", "/EHsc", "/std:c++17", "/O2", "/MT", "/W4", "/permissive-",
-    "/Zi", "/guard:cf", "/DNDEBUG", "/DWIN32_LEAN_AND_MEAN", "/LD",
-    $Src, $AsmObj, $ResObj, "/Fe:$Out", "/Fo:$Obj",
+    "/Zi", "/guard:cf", "/DNDEBUG", "/DWIN32_LEAN_AND_MEAN", "/LD", "/Brepro",
+    $Src, $AsmObj, $ResObj, "/Fe:$Out", "/Fo:$Obj", "/Fd:$(Join-Path $OutDir 'vc140.pdb')",
     "/link", "/DEF:$Def", "/DEBUG", "/OPT:REF", "/OPT:ICF", "/GUARD:CF", "/MACHINE:X64",
+    "/Brepro", "/PDBALTPATH:%_PDB%",
     "user32.lib")
 
 if ($vcvars) {
     # Importa o ambiente do vcvars via .cmd temporario (quotacao estavel no PS 5.1 e 7+).
     $tmpCmd = Join-Path ([System.IO.Path]::GetTempPath()) "spiderfix_vcvars.cmd"
-    "@echo off`r`ncall `"$vcvars`" >nul`r`nset" | Set-Content -LiteralPath $tmpCmd -Encoding Ascii
+    # vcvars do VS 18 chama vswhere pelo PATH; sem isso imprime "nao reconhecido".
+    "@echo off`r`nset `"PATH=$vswhereDir;%PATH%`"`r`ncall `"$vcvars`" >nul`r`nset" | Set-Content -LiteralPath $tmpCmd -Encoding Ascii
     try {
         $lines = & cmd /s /c "`"$tmpCmd`""
         foreach ($line in $lines) {
@@ -73,6 +77,7 @@ foreach ($t in @("cl.exe", "ml64.exe", "link.exe", "rc.exe")) {
     }
 }
 
+# ml64 nao aceita /Brepro; o timestamp do PE final vem do link /Brepro.
 & ml64.exe /nologo /Zi /c /Fo $AsmObj $Asm
 if ($LASTEXITCODE -ne 0) { throw "ml64 falhou: $LASTEXITCODE" }
 

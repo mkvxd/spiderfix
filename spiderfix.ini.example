@@ -1,5 +1,6 @@
 # spiderfix.ini (opcional, ao lado da d3d12.dll na pasta do jogo).
-# Chave presente vence a variavel de ambiente. 0 desliga, 1 liga.
+# Chave presente vence a variavel de ambiente (inclusive com 0): comente a
+# linha para usar a variavel. 0/1, y/n, yes/no, true/false, on/off.
 
 # Log mestre: 0 off, 1 com orcamento (padrao)
 Log = 1

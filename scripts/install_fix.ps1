@@ -1,11 +1,20 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [Parameter(Mandatory = $true)]
     [string]$GamePath
 )
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "SpiderFixCommon.ps1")
+
+if (!$GamePath) {
+    # Sem -GamePath: tenta achar o jogo (Steam/Epic).
+    $GamePath = Find-SpiderManPath
+    if (!$GamePath) {
+        throw "Pasta do jogo nao encontrada automaticamente. Use -GamePath."
+    }
+    Write-Host "Pasta do jogo detectada: $GamePath"
+}
 $GamePath = (Resolve-Path -LiteralPath $GamePath).ProviderPath
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $dll = Join-Path $repoRoot "release\d3d12.dll"
@@ -37,25 +46,6 @@ function Get-PEMachine([string]$Path) {
     }
 }
 
-function Test-SpiderFixDll([string]$Path) {
-    try {
-        return ((Get-Item -LiteralPath $Path).VersionInfo.ProductName -eq "SpiderFix")
-    } catch {
-        return $false
-    }
-}
-
-function Test-AdminWrite([string]$Dir) {
-    try {
-        $t = Join-Path $Dir ".spiderfix_write_test"
-        [System.IO.File]::WriteAllText($t, "x")
-        [System.IO.File]::Delete($t) # .NET: funciona mesmo em -WhatIf.
-        return $true
-    } catch {
-        return $false
-    }
-}
-
 if (!(Test-Path -LiteralPath $dll)) {
     throw "Nao encontrei release\d3d12.dll."
 }
@@ -75,8 +65,7 @@ if ($proc) {
 
 if (!(Test-AdminWrite $GamePath)) {
     Write-Host "Sem escrita em $GamePath. Relancando como administrador..."
-    Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`" -GamePath `"$GamePath`""
-    exit 0
+    exit (Invoke-SpiderFixElevated $PSCommandPath $GamePath $PSBoundParameters.ContainsKey("WhatIf"))
 }
 
 $dxgi = Join-Path $GamePath "dxgi.dll"
@@ -94,13 +83,26 @@ if (Test-Path -LiteralPath $target) {
     }
     if (Test-SpiderFixDll $target) {
         Write-Host "Proxy antiga detectada pelo marcador. Atualizando sem novo backup."
-    } elseif (!(Test-Path -LiteralPath $backupDir)) {
-        # Backup unico e fixo, so de arquivo que nao e a proxy.
-        if ($PSCmdlet.ShouldProcess($backupDir, "Criar backup original")) {
-            New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
-            Copy-Item -LiteralPath $target -Destination (Join-Path $backupDir "d3d12.dll") -Force
-            @{ originalHash = $targetHash; date = (Get-Date -Format "o"); proxyHash = $dllHash } |
-                ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding Ascii
+    } else {
+        if (Test-Path -LiteralPath $backupDir) {
+            $origHash = $null
+            try {
+                $origHash = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).originalHash
+            } catch {}
+            if ($origHash -ne $targetHash) {
+                # Backup original ja existe e a dll atual e outra (outro mod): backup novo com timestamp.
+                $backupDir = Join-Path $GamePath ("SpiderFixBackup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $manifest = Join-Path $backupDir "manifest.json"
+            }
+        }
+        if (!(Test-Path -LiteralPath $backupDir)) {
+            # Backup so de arquivo que nao e a proxy.
+            if ($PSCmdlet.ShouldProcess($backupDir, "Criar backup original")) {
+                New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+                Copy-Item -LiteralPath $target -Destination (Join-Path $backupDir "d3d12.dll") -Force
+                @{ originalHash = $targetHash; date = (Get-Date -Format "o"); proxyHash = $dllHash } |
+                    ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding Ascii
+            }
         }
     }
 }
@@ -114,6 +116,10 @@ if ($PSCmdlet.ShouldProcess($target, "Instalar proxy d3d12.dll")) {
         if (Test-Path -LiteralPath $bak) {
             Copy-Item -LiteralPath $bak -Destination $target -Force
             Write-Host "Backup restaurado apos falha."
+        } else {
+            # Install limpo: nao deixa dll corrompida no jogo.
+            Remove-Item -LiteralPath $target -Force
+            Write-Host "d3d12.dll corrompida removida."
         }
         throw "Hash diverge apos copia. Esperado $dllHash, obtido $dstHash."
     }

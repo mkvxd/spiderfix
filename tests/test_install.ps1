@@ -90,11 +90,76 @@ try {
 # 5: -WhatIf nao toca em nada.
 $sb = New-GameSandbox
 try {
-    $before = @(Get-ChildItem -LiteralPath $sb -Recurse | Select-Object FullName)
+    $before = (Get-ChildItem -LiteralPath $sb -Recurse -File | Get-FileHash -Algorithm SHA256 |
+        ForEach-Object { "$($_.Path)|$($_.Hash)" }) -join ";"
     & $install -GamePath $sb -WhatIf
     & $uninstall -GamePath $sb -WhatIf
-    $after = @(Get-ChildItem -LiteralPath $sb -Recurse | Select-Object FullName)
-    Assert-True ($before.Count -eq $after.Count) "WhatIf sem efeito colateral"
+    $after = (Get-ChildItem -LiteralPath $sb -Recurse -File | Get-FileHash -Algorithm SHA256 |
+        ForEach-Object { "$($_.Path)|$($_.Hash)" }) -join ";"
+    Assert-True ($before -eq $after) "WhatIf sem efeito colateral (hashes)"
+} finally {
+    Remove-Item -LiteralPath $sb -Recurse -Force
+}
+
+function Get-Sha([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+# 6: manifest com hash divergente: uninstall nao restaura e mantem o backup.
+$sb = New-GameSandbox
+try {
+    $t = Join-Path $sb "d3d12.dll"
+    $bak = Join-Path $sb "SpiderFixBackup_original"
+    Copy-Item -LiteralPath "C:\Windows\System32\version.dll" -Destination $t -Force
+    $origHash = Get-Sha $t
+    & $install -GamePath $sb
+    $man = Join-Path $bak "manifest.json"
+    $m = Get-Content -LiteralPath $man -Raw | ConvertFrom-Json
+    $m.originalHash = "0000"
+    $m | ConvertTo-Json | Set-Content -LiteralPath $man -Encoding Ascii
+    & $uninstall -GamePath $sb 3>$null
+    Assert-True (Test-Path -LiteralPath (Join-Path $bak "d3d12.dll")) "manifest divergente mantem backup"
+    Assert-True ((Get-Sha (Join-Path $bak "d3d12.dll")) -eq $origHash) "backup mantido intacto"
+    Assert-True (!(Test-Path -LiteralPath $t) -or (Get-Sha $t) -ne $origHash) "manifest divergente nao restaura"
+} finally {
+    Remove-Item -LiteralPath $sb -Recurse -Force
+}
+
+# 7: outro mod por cima da proxy: uninstall recusa e deixa o mod intacto.
+$sb = New-GameSandbox
+try {
+    $t = Join-Path $sb "d3d12.dll"
+    Copy-Item -LiteralPath "C:\Windows\System32\version.dll" -Destination $t -Force
+    & $install -GamePath $sb
+    Copy-Item -LiteralPath "C:\Windows\System32\winmm.dll" -Destination $t -Force
+    $modHash = Get-Sha $t
+    & $uninstall -GamePath $sb 3>$null
+    Assert-True ((Get-Sha $t) -eq $modHash) "uninstall nao sobrescreve outro mod"
+    Assert-True (Test-Path -LiteralPath (Join-Path $sb "SpiderFixBackup_original\d3d12.dll")) "backup mantido com outro mod"
+} finally {
+    Remove-Item -LiteralPath $sb -Recurse -Force
+}
+
+# 8: reinstall sobre outro mod com backup existente: backup timestampado e uninstall restaura o mod.
+$sb = New-GameSandbox
+try {
+    $t = Join-Path $sb "d3d12.dll"
+    Copy-Item -LiteralPath "C:\Windows\System32\version.dll" -Destination $t -Force
+    & $install -GamePath $sb
+    Copy-Item -LiteralPath "C:\Windows\System32\winmm.dll" -Destination $t -Force
+    $modHash = Get-Sha $t
+    & $install -GamePath $sb
+    $ts = @(Get-ChildItem -LiteralPath $sb -Filter "SpiderFixBackup_*" -Directory |
+        Where-Object { $_.Name -match '^SpiderFixBackup_\d{8}_\d{6}$' })
+    Assert-True ($ts.Count -eq 1) "backup timestampado criado"
+    if ($ts.Count -eq 1) {
+        Assert-True ((Get-Sha (Join-Path $ts[0].FullName "d3d12.dll")) -eq $modHash) "backup timestampado guarda o mod"
+        $m = Get-Content -LiteralPath (Join-Path $ts[0].FullName "manifest.json") -Raw | ConvertFrom-Json
+        Assert-True ($m.originalHash -eq $modHash) "manifest timestampado com hash do mod"
+    }
+    Assert-True ((Get-Sha $t) -eq $releaseHash) "proxy instalada sobre o mod"
+    & $uninstall -GamePath $sb
+    Assert-True ((Get-Sha $t) -eq $modHash) "uninstall restaura o mod (backup mais novo)"
 } finally {
     Remove-Item -LiteralPath $sb -Recurse -Force
 }

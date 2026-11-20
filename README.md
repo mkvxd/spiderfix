@@ -2,131 +2,205 @@
 
 # SpiderFix
 
-**Proxy `d3d12.dll` que abre Marvel's Spider-Man 2 em GPUs sem feature level 12_1.**
+**Faz Marvel's Spider-Man 2 abrir em placas de vídeo sem DirectX 12 feature level 12_1.**
 
+![Versão](https://img.shields.io/badge/vers%C3%A3o-2.0-2ea44f)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011%20x64-0078D4?logo=windows&logoColor=white)
 ![DirectX](https://img.shields.io/badge/DirectX-12-107C10)
-![C++](https://img.shields.io/badge/C%2B%2B-MSVC%20x64-00599C?logo=cplusplus&logoColor=white)
 ![Testado](https://img.shields.io/badge/testado-RX%20580-ED1C24?logo=amd&logoColor=white)
 
 [English](README_EN.md)
 
 </div>
 
+O jogo exige feature level 12_1 e se recusa a abrir em placas que param no 12_0, como a RX 580. O SpiderFix é uma `d3d12.dll` que fica na pasta do jogo: ela corrige as poucas chamadas que quebram nessas placas e repassa todo o resto para a DLL original do Windows. Nada no sistema é alterado e a remoção devolve a pasta ao estado anterior.
 
-O jogo exige GPU com feature level 12_1 e recusa abrir em placas que ficam em 12_0, como a RX 580. O SpiderFix entra no lugar da `d3d12.dll`, corrige as chamadas que quebram nessas placas e repassa o resto para a DLL do sistema. Você copia um arquivo para a pasta do jogo e joga.
+Em placas que já suportam 12_1, a DLL detecta isso sozinha e não interfere.
 
 ## Sumário
 
-- [Início rápido](#início-rápido)
-- [Requisitos](#requisitos)
-- [Instalação e remoção](#instalação-e-remoção)
-- [O que a proxy faz](#o-que-a-proxy-faz)
-- [Configuração](#configuração)
+- [Instalação](#instalação)
+- [Remoção](#remoção)
 - [Interface gráfica](#interface-gráfica)
-- [Compilação](#compilação)
+- [Configuração](#configuração)
 - [Solução de problemas](#solução-de-problemas)
-- [Créditos](#créditos)
-- [Aviso](#aviso)
+- [Como funciona](#como-funciona)
+- [Compilar a partir do código](#compilar-a-partir-do-código)
+- [Novidades da v2.0](#novidades-da-v20)
+- [Versões testadas](#versões-testadas)
+- [Antivírus e segurança](#antivírus-e-segurança)
+- [Aviso legal](#aviso-legal)
 
-## Início rápido
+## Instalação
+
+Requisitos: Windows 10 ou 11 x64 e o jogo pela Steam ou pela Epic.
 
 1. Feche o jogo.
-2. Clone o repositório e abra o PowerShell na pasta dele:
+2. Baixe `spiderfix.zip` e `SHA256SUMS.txt` em [Releases](https://github.com/mkvxd/spiderfix/releases/latest).
+3. Confira o download (opcional, recomendado):
 
    ```powershell
-   git clone https://github.com/mkvxd/spiderfix.git
-   cd spiderfix
+   Get-FileHash .\spiderfix.zip -Algorithm SHA256              # deve bater com a linha spiderfix.zip do SHA256SUMS.txt
+   gh attestation verify spiderfix.zip --repo mkvxd/spiderfix  # requer GitHub CLI
    ```
 
-3. Rode o instalador apontando para a pasta do jogo:
+4. Extraia o zip, abra o PowerShell dentro da pasta extraída e libere os arquivos baixados da internet:
 
    ```powershell
-   .\scripts\install_fix.ps1 -GamePath "C:\Program Files (x86)\Steam\steamapps\common\Marvel's Spider-Man 2"
+   Get-ChildItem -Recurse | Unblock-File
    ```
 
-4. Abra o jogo pela Steam.
+5. Instale:
 
-## Requisitos
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\install_fix.ps1
+   ```
 
-| Uso | Requisito |
-|-----|-----------|
-| Jogar | Windows 10 ou 11 x64 |
-| Jogar | Cópia Steam do jogo |
-| Compilar | MSVC x64 e Windows SDK |
+   O instalador acha a pasta do jogo nas bibliotecas da Steam e nos manifestos da Epic. Se não achar, informe o caminho:
 
-## Instalação e remoção
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\install_fix.ps1 -GamePath "D:\SteamLibrary\steamapps\common\Marvel's Spider-Man 2"
+   ```
 
-O `install_fix.ps1` executa estes passos:
+6. Abra o jogo normalmente. Um aviso de 4 segundos no canto da tela confirma que o SpiderFix carregou.
 
-- Confere se o jogo está fechado.
-- Guarda o arquivo anterior em `SpiderFixBackup_original`, junto com um `manifest.json`.
-- Copia a DLL e valida o hash depois da cópia.
+O `-ExecutionPolicy Bypass` vale só para aquele comando; a política do sistema não muda. Se a pasta do jogo exigir administrador, o script pede elevação (UAC) e espera o resultado.
 
-Para remover, use o `uninstall_fix.ps1`:
+**O que o instalador faz:** confere que o jogo está fechado, guarda qualquer `d3d12.dll` que já esteja na pasta (de outro mod, por exemplo) num backup com `manifest.json`, copia a DLL e valida o hash. Se a cópia sair corrompida, ele desfaz.
+
+## Remoção
 
 ```powershell
-.\scripts\uninstall_fix.ps1 -GamePath "C:\Program Files (x86)\Steam\steamapps\common\Marvel's Spider-Man 2"
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall_fix.ps1
 ```
 
-O uninstall restaura o backup e apaga as pastas que o instalador criou. Ele recusa apagar a `d3d12.dll` de outro mod quando não existe backup.
+O desinstalador restaura o backup mais recente e só então apaga as pastas de backup. Ele é conservador de propósito:
 
-## O que a proxy faz
+- se a `d3d12.dll` da pasta não for o SpiderFix (você instalou outro mod por cima), ele não mexe em nada;
+- se o backup não bater com o hash registrado, ele não restaura e mantém o backup, avisando o caminho.
 
-| Comportamento | Detalhe |
-|---------------|---------|
-| Fallback de feature level | Tenta criar o device em 12_0 antes do nível pedido, depois em 11_1 e 11_0. Sondas com `ppDevice` nulo seguem a mesma sequência. |
-| `CheckFeatureSupport` | Responde 12_0 em `FEATURE_LEVELS` quando o driver nega ou reporta menos. O resto das consultas passa sem alteração. |
-| PSO depth-only | Repete a criação sem pixel shader quando o driver devolve `E_INVALIDARG`. Sem isso a GPU trava (`0x887A0006`). |
-| Popup de GPU incompatível | Dispensa o aviso e devolve o botão que cada tipo de diálogo espera. |
-| Exports | Resolve a jump-table uma vez e repassa os outros 18 exports para a `d3d12.dll` do System32. |
-| Detecção de GPU | Em GPU 12_1 ou superior, a proxy ignora o fix e faz repasse puro, sem hooks. `SPIDERFIX_FORCE=1` força o fix. |
-
-## Configuração
-
-### Variáveis de ambiente
-
-| Variável | Efeito |
-|----------|--------|
-| `SPIDERFIX_LOG=0` | Desliga o log em `spiderfix.log` |
-| `SPIDERFIX_DEPTH_RETRY=0` | Desliga o retry depth-only (o jogo trava sem ele) |
-| `SPIDERFIX_FORCE=1` | Força o fix em GPU 12_1 ou superior |
-
-### Arquivo `spiderfix.ini`
-
-Coloque o `spiderfix.ini` ao lado da DLL para ajustar as mesmas opções sem variável de ambiente. Use o `spiderfix.ini.example` como modelo.
-
-Chaves disponíveis: `Log`, `LogLevel`, `ForceActive`, `DepthRetry`, `HookPipelineLibrary` e `ShowOSD`.
-
-Na primeira abertura, o jogo mostra um aviso do SpiderFix por 4 segundos. `ShowOSD=0` desliga o aviso.
+Os dois scripts aceitam `-WhatIf` para mostrar o que fariam sem alterar nada.
 
 ## Interface gráfica
 
-O `scripts\SpiderFixGUI.ps1` abre uma janela com quatro ações:
-
-- instalar
-- desinstalar
-- alternar o `cache.pso`
-- exportar o diagnóstico para a Área de Trabalho
-
-## Compilação
-
 ```powershell
-.\scripts\build_spider_proxy.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\SpiderFixGUI.ps1
 ```
 
-O script exige PowerShell x64, MSVC x64 e Windows SDK. Ele gera `release\d3d12.dll` e `release\d3d12.pdb` com as flags `/W4 /permissive- /guard:cf`.
+A janela mostra o estado da pasta selecionada (instalado e versão, não instalado, ou outra `d3d12.dll` presente) e tem quatro botões:
+
+| Botão | Ação |
+|-------|------|
+| Instalar | Roda o `install_fix.ps1` sem travar a janela e mostra a saída. |
+| Desinstalar | Roda o `uninstall_fix.ps1`. |
+| Alternar cache.pso | Ativa ou desativa o cache de shaders do jogo (útil se travar no loading). |
+| Diagnóstico | Gera um relatório na Área de Trabalho: versão do Windows e do jogo, conteúdo do `spiderfix.ini`, outras DLLs proxy na pasta e SHA256 da DLL. Anexe esse arquivo ao abrir uma issue. |
+
+## Configuração
+
+Nada precisa ser configurado. Para ajustar, copie `spiderfix.ini.example` para a pasta do jogo com o nome `spiderfix.ini`. Cada opção também pode vir de uma variável de ambiente; **uma chave presente no INI sempre vence a variável**, inclusive quando vale 0.
+
+| Chave INI | Variável | Padrão | Efeito |
+|-----------|----------|--------|--------|
+| `Log` | `SPIDERFIX_LOG` | 1 | Grava `spiderfix.log` ao lado da DLL. |
+| `LogLevel` | — | 1 | 0 desliga, 1 limita mensagens repetitivas, 2 grava tudo. Vence `Log`. |
+| `ForceActive` | `SPIDERFIX_FORCE` | 0 | Aplica o fix mesmo em placa 12_1 ou superior. |
+| `DepthRetry` | `SPIDERFIX_DEPTH_RETRY` | 1 | Recria PSOs depth-only sem pixel shader quando o driver recusa. Sem isso o jogo trava. |
+| `HookPipelineLibrary` | `SPIDERFIX_HOOK_LIB` | 1 | Aplica o mesmo retry aos shaders carregados do `cache.pso`. |
+| `ShowOSD` | `SPIDERFIX_OSD` | 1 | Mostra o aviso de 4 s ao abrir o jogo. |
+
+Valores aceitos: `0`/`1` (e `2` em `LogLevel`), `yes`/`no`, `y`/`n`, `true`/`false`, `on`/`off`. Comentários com `#` ou `;`, inclusive no fim da linha. O arquivo pode ser ANSI, UTF-8 (com ou sem BOM) ou UTF-16. Chaves e valores inválidos são apontados no log.
+
+O log tem no máximo 512 KB; ao passar disso vira `spiderfix.log.old` e um novo começa.
 
 ## Solução de problemas
 
 | Sintoma | O que fazer |
 |---------|-------------|
-| O jogo não abre depois da instalação | Confira se `release\d3d12.dll` e `Spider-Man2.exe` são x64 e se o hash da DLL na pasta do jogo bate com o do release. O `install_fix.ps1` valida os dois. |
-| O jogo trava no loading | Renomeie `cache.pso` para `cache.pso.disabled` na pasta do jogo. |
-| O `spiderfix.log` não aparece | Um `SPIDERFIX_LOG=0` global desliga a escrita. Apague a variável ou defina `SPIDERFIX_LOG=1`. |
+| "A execução de scripts foi desabilitada" | Rode `Get-ChildItem -Recurse \| Unblock-File` na pasta extraída e use `powershell -ExecutionPolicy Bypass -File ...`. |
+| O instalador não acha o jogo | Passe `-GamePath` com a pasta que contém `Spider-Man2.exe`. |
+| O jogo não abre depois de instalar | Gere o diagnóstico na interface gráfica e veja se há outra DLL proxy (`dxgi.dll`, `dinput8.dll`...) na pasta. Abra uma issue com o relatório e o `spiderfix.log`. |
+| Trava na tela de loading | Desative o `cache.pso` (botão na interface, ou renomeie para `cache.pso.disabled`). O jogo recompila os shaders na próxima abertura. |
+| Sombras ou profundidade estranhas em alguns objetos | Efeito conhecido do retry de PSO (veja [Como funciona](#como-funciona)). É o preço para o jogo não travar. |
+| O `spiderfix.log` não aparece | Confira se o INI não tem `Log=0` ou `LogLevel=0` e se não existe uma variável `SPIDERFIX_LOG=0` no sistema. |
+| Quero saber se o fix está ativo | O aviso de 4 s diz "modo FIX" ou "modo BYPASS". O log registra cada passo. |
 
-Se o problema continuar, abra uma [issue](https://github.com/mkvxd/spiderfix/issues) e anexe o diagnóstico exportado pela interface gráfica.
+Problema persistente: abra uma [issue](https://github.com/mkvxd/spiderfix/issues) com o relatório de diagnóstico e o `spiderfix.log`.
 
-## Aviso
+## Como funciona
 
-Projeto não oficial, sem vínculo com Nixxes, Insomniac, Sony ou AMD. O teste cobriu a RX 580. Outra placa pede teste próprio antes de uma sessão longa.
+O Windows carrega a `d3d12.dll` da pasta do jogo antes da do sistema. O SpiderFix aproveita isso e carrega a DLL original pelo caminho completo do System32.
+
+| Parte | O que faz |
+|-------|-----------|
+| Detecção | Pergunta ao driver se a placa **que o jogo escolheu** suporta 12_1 (importa em notebooks com duas GPUs). Se suportar, tudo é repassado sem nenhum hook. |
+| Criação do device | Tenta 12_0 antes do nível pedido pelo jogo, depois 11_1 e 11_0. Erros que não são de suporte voltam intactos para o jogo. |
+| `CheckFeatureSupport` | Responde 12_0 na consulta de feature levels quando o driver reporta menos. Nenhuma outra consulta é alterada: recursos que a placa não tem continuam reportados como ausentes. |
+| PSO depth-only | Quando o driver recusa um pipeline só de profundidade com pixel shader, recria sem o shader. Isso evita o travamento `0x887A0006`, mas PSOs que usam o shader para recorte (alpha-test) podem gerar sombras imperfeitas. |
+| Aviso de GPU incompatível | Dispensa o popup de requisitos do jogo. Só age nos 3 primeiros minutos e nunca em mensagens de crash ou de device removido. Toda `MessageBox` do jogo, dispensada ou não, vai para o log. |
+| Demais exports | Repassados direto para a DLL do sistema por uma tabela de salto. |
+
+Limitações conhecidas: devices criados via `D3D12GetInterface`/`DeviceFactory` não passam pelo fix (o jogo não usa esse caminho), e o popup só é interceptado depois que o jogo cria o primeiro device D3D12.
+
+## Compilar a partir do código
+
+Instale o Visual Studio 2022 ou mais novo (ou o "Build Tools for Visual Studio") com a carga de trabalho **Desenvolvimento para desktop com C++**, marcando só:
+
+- Ferramentas de Build do MSVC x64/x86 (mais recente)
+- SDK do Windows 11
+
+Depois, num PowerShell x64:
+
+```powershell
+.\scripts\build_spider_proxy.ps1      # gera release\d3d12.dll
+.\tests\smoke_test.ps1                # carrega a DLL e cria um device real
+.\tests\config_test.ps1               # parser do INI e stubs de export
+.\tests\test_install.ps1              # instalador/desinstalador numa pasta falsa
+.\scripts\install_fix.ps1             # instala a DLL recém-compilada
+```
+
+O build usa `/W4 /permissive- /guard:cf /Brepro` e CRT estático (não depende de redistributable). Cada tag `v*` publicada no GitHub gera o release automaticamente, com `SHA256SUMS.txt` e atestado de proveniência.
+
+## Novidades da v2.0
+
+**Segurança dos seus arquivos**
+- O desinstalador não apaga mais backups quando a restauração falha ou é recusada.
+- Reinstalar por cima de outro mod cria um backup novo em vez de sobrescrever.
+- O desinstalador não mexe numa `d3d12.dll` que não seja o SpiderFix.
+
+**Instalação**
+- Detecção automática da pasta do jogo (Steam e Epic); `-GamePath` virou opcional.
+- A elevação de administrador espera o resultado e repassa o código de saída.
+- Pacote do release corrigido: o zip agora instala direto.
+
+**DLL**
+- Detecção de GPU pelo adaptador que o jogo usa, não pelo padrão do sistema.
+- Corrigida a corrupção de argumentos float em exports chamados antes do primeiro device.
+- Falha ao carregar a DLL do sistema devolve erro em vez de sucesso falso.
+- Popup dispensado só quando é de fato o aviso de requisitos; erros reais aparecem.
+- INI tolerante a UTF-8 com BOM, UTF-16 e comentários; `ForceActive=0` vence a variável de ambiente.
+- Log com rotação segura e todas as `MessageBox` registradas.
+
+**Interface gráfica**
+- Não congela durante a instalação, mostra o estado da pasta e gera um diagnóstico mais completo.
+
+**Projeto**
+- Releases gerados pela CI com SHA256 e atestado; actions fixadas por SHA; testes cobrem o modo forçado, o parser do INI e os cenários de backup.
+
+## Versões testadas
+
+| Versão do jogo | Loja | GPU | Driver | Resultado |
+|----------------|------|-----|--------|-----------|
+| 2.810.0.0 | Steam | RX 580 | 26.5.2 | ✅ |
+
+Testou em outra placa? Abra uma issue com o resultado para entrar nesta tabela.
+
+## Antivírus e segurança
+
+Alguns antivírus acusam falso positivo: a DLL não é assinada e altera a tabela de importação do jogo para dispensar o popup. Antes de liberar, confira o hash e o atestado do download. Se precisar criar exclusão, faça só para a pasta do jogo.
+
+A DLL não acessa a rede, só grava o próprio log na pasta do jogo e não altera arquivos do sistema.
+
+## Aviso legal
+
+Projeto não oficial, sem vínculo com Nixxes, Insomniac, Sony ou AMD. Testado na RX 580; em outra placa, faça um teste curto antes de uma sessão longa. Licença MIT (veja [LICENSE](LICENSE)).
