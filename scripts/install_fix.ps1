@@ -1,15 +1,20 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$GamePath
+    [string]$GamePath,
+    [string]$LogFile
 )
 
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "SpiderFixCommon.ps1")
 
+if ($LogFile) {
+    exit (Invoke-SpiderFixWithLog $PSCommandPath $PSBoundParameters)
+}
+
 if (!$GamePath) {
-    # Sem -GamePath: tenta achar o jogo (Steam/Epic).
-    $GamePath = Find-SpiderManPath
+    # Sem -GamePath: tenta achar o jogo (Steam/Epic). Drive desconectado nao pode abortar.
+    try { $GamePath = Find-SpiderManPath } catch { $GamePath = $null }
     if (!$GamePath) {
         throw "Pasta do jogo nao encontrada automaticamente. Use -GamePath."
     }
@@ -75,6 +80,14 @@ if (Test-Path -LiteralPath $dxgi) {
 
 $dllHash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
 
+# Sobra de instalacao interrompida: nunca e usada, so removida.
+$stale = $target + ".sfnew"
+if (Test-Path -LiteralPath $stale) {
+    if ($PSCmdlet.ShouldProcess($stale, "Remover copia incompleta anterior")) {
+        Remove-Item -LiteralPath $stale -Force
+    }
+}
+
 if (Test-Path -LiteralPath $target) {
     $targetHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
     if ($targetHash -eq $dllHash) {
@@ -91,38 +104,37 @@ if (Test-Path -LiteralPath $target) {
             } catch {}
             if ($origHash -ne $targetHash) {
                 # Backup original ja existe e a dll atual e outra (outro mod): backup novo com timestamp.
-                $backupDir = Join-Path $GamePath ("SpiderFixBackup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+                # Milissegundos: dois installs no mesmo segundo nao colidem (colisao pularia o backup).
+                $backupDir = Join-Path $GamePath ("SpiderFixBackup_" + (Get-Date -Format "yyyyMMdd_HHmmss_fff"))
                 $manifest = Join-Path $backupDir "manifest.json"
+                if (Test-Path -LiteralPath $backupDir) {
+                    throw "Pasta de backup ja existe: $backupDir. Rode de novo."
+                }
             }
         }
         if (!(Test-Path -LiteralPath $backupDir)) {
             # Backup so de arquivo que nao e a proxy.
             if ($PSCmdlet.ShouldProcess($backupDir, "Criar backup original")) {
-                New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
-                Copy-Item -LiteralPath $target -Destination (Join-Path $backupDir "d3d12.dll") -Force
-                @{ originalHash = $targetHash; date = (Get-Date -Format "o"); proxyHash = $dllHash } |
-                    ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding Ascii
+                # Monta em pasta tmp e renomeia no fim: pasta com nome final sempre tem dll + manifest.
+                $tmpDir = Join-Path $GamePath ("SpiderFixBackup_tmp_" + [Guid]::NewGuid().ToString("N"))
+                New-Item -ItemType Directory -Path $tmpDir | Out-Null
+                try {
+                    Copy-SpiderFixAtomic $target (Join-Path $tmpDir "d3d12.dll") $targetHash
+                    @{ originalHash = $targetHash; date = (Get-Date -Format "o"); proxyHash = $dllHash } |
+                        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $tmpDir "manifest.json") -Encoding Ascii
+                    Rename-Item -LiteralPath $tmpDir -NewName (Split-Path -Leaf $backupDir)
+                } catch {
+                    Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+                    throw
+                }
             }
         }
     }
 }
 
 if ($PSCmdlet.ShouldProcess($target, "Instalar proxy d3d12.dll")) {
-    Copy-Item -LiteralPath $dll -Destination $target -Force
-
-    $dstHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
-    if ($dstHash -ne $dllHash) {
-        $bak = Join-Path $backupDir "d3d12.dll"
-        if (Test-Path -LiteralPath $bak) {
-            Copy-Item -LiteralPath $bak -Destination $target -Force
-            Write-Host "Backup restaurado apos falha."
-        } else {
-            # Install limpo: nao deixa dll corrompida no jogo.
-            Remove-Item -LiteralPath $target -Force
-            Write-Host "d3d12.dll corrompida removida."
-        }
-        throw "Hash diverge apos copia. Esperado $dllHash, obtido $dstHash."
-    }
+    # Copia atomica com hash: em falha a d3d12.dll anterior fica intacta.
+    Copy-SpiderFixAtomic $dll $target $dllHash
 }
 
 Write-Host "Fix instalado em:"

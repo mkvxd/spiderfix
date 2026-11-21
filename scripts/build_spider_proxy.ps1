@@ -27,20 +27,23 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 $vcvars = $null
 $vswhereDir = $null
-foreach ($c in @(
-    "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
-    "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
-)) {
-    if (Test-Path -LiteralPath $c) {
-        $vswhereDir = Split-Path -Parent $c
-        $vsPath = & $c -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-        if ($vsPath) {
-            $candidate = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
-            if (Test-Path -LiteralPath $candidate) {
-                $vcvars = $candidate
+# Ja num dev env x64 (CI apos msvc-dev-cmd): nao roda vswhere/vcvars de novo.
+if ($env:VSCMD_ARG_TGT_ARCH -ne "x64") {
+    foreach ($c in @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
+        "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
+    )) {
+        if (Test-Path -LiteralPath $c) {
+            $vswhereDir = Split-Path -Parent $c
+            $vsPath = & $c -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($vsPath) {
+                $candidate = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+                if (Test-Path -LiteralPath $candidate) {
+                    $vcvars = $candidate
+                }
             }
+            break
         }
-        break
     }
 }
 
@@ -53,7 +56,7 @@ $clArgs = @("/nologo", "/EHsc", "/std:c++17", "/O2", "/MT", "/W4", "/permissive-
 
 if ($vcvars) {
     # Importa o ambiente do vcvars via .cmd temporario (quotacao estavel no PS 5.1 e 7+).
-    $tmpCmd = Join-Path ([System.IO.Path]::GetTempPath()) "spiderfix_vcvars.cmd"
+    $tmpCmd = Join-Path ([System.IO.Path]::GetTempPath()) ("spiderfix_vcvars_" + [Guid]::NewGuid().ToString("N") + ".cmd")
     # vcvars do VS 18 chama vswhere pelo PATH; sem isso imprime "nao reconhecido".
     "@echo off`r`nset `"PATH=$vswhereDir;%PATH%`"`r`ncall `"$vcvars`" >nul`r`nset" | Set-Content -LiteralPath $tmpCmd -Encoding Ascii
     try {

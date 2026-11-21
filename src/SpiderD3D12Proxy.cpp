@@ -7,7 +7,9 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <atomic>
 #include <new>
+#include <dxgi.h>
 
 // SpiderFix - proxy d3d12.dll para Marvel's Spider-Man 2 em GPU sem FL 12_1.
 // Funcao principal: fallback de feature level em D3D12CreateDevice, spoof de
@@ -21,14 +23,17 @@
 //   em DllMain exigiria trabalho sob loader lock).
 // - Nao finge D3D12_OPTIONS (ROV, conservative raster): mentir ali faria o
 //   jogo usar recurso que a GPU nao tem e travar.
-// - Retry remove o PS: se ele faz alpha-test (clip/discard) ou escreve SV_Depth,
-//   sombra/profundidade sai errada nesses PSOs. Jogo vivo > pixel perfeito.
+// - Retry remove o PS. Na RX 580 o driver recusa (E_INVALIDARG) PSO depth-only
+//   cujo PS usa ROV (RasterizerOrdered*); clip/discard passa normal. Logo o
+//   que se perde sao as escritas ROV desse passe. Jogo vivo > pixel perfeito.
+//   Nao restringimos o retry a PS com ROV: detectar exige refletir DXBC/DXIL
+//   (dxcompiler) e um falso negativo traria de volta o device hung.
 
 #ifndef DXGI_ERROR_UNSUPPORTED
 #define DXGI_ERROR_UNSUPPORTED 0x887A0004L
 #endif
 
-#define SPIDERFIX_VERSION 0x00020000u // v2.0.0
+#define SPIDERFIX_VERSION 0x00020100u // v2.1.0
 
 using D3D12CreateDevice_t = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 using MessageBoxA_t = int(WINAPI*)(HWND, LPCSTR, LPCSTR, UINT);
@@ -61,7 +66,7 @@ static constexpr size_t kCreateGraphicsPipelineStateVtableIndex = 10;
 static constexpr size_t kCheckFeatureSupportVtableIndex = 13;
 static constexpr size_t kCreatePipelineLibraryVtableIndex = 44;
 static constexpr size_t kCreatePipelineStateVtableIndex = 47;
-static constexpr size_t kMaxVtableHooks = 8;
+static constexpr size_t kMaxVtableHooks = 32;
 static constexpr ULONGLONG kMaxLogBytes = 512 * 1024;
 
 static INIT_ONCE g_d3d12InitOnce = INIT_ONCE_STATIC_INIT;
@@ -86,8 +91,10 @@ struct VtableHook {
     CreatePipelineState_t psoStream;
     CreatePipelineLibrary_t libCreate;
 };
+// Escrita so sob g_devicePatchLock (exclusivo); leitura sem lock: a entrada e
+// preenchida antes de publicar o contador (release) e nunca muda depois.
 static VtableHook g_vhooks[kMaxVtableHooks] = {};
-static size_t g_vhookCount = 0;
+static std::atomic<size_t> g_vhookCount{0};
 
 // Tabela de repasse dos exports (ordem sincronizada com D3D12ProxyStubs.asm).
 // Preenchida uma vez no InitOriginalD3D12; entradas ausentes ganham fallback
@@ -414,15 +421,21 @@ static void EnsureLogOpenLocked() {
     }
 }
 
+// Reentrada na mesma thread (ex.: excecao dentro do Log e um handler chamando
+// MessageBox, que tambem loga) travaria no SRW nao recursivo: descarta a linha.
+static thread_local bool t_inLog = false;
+
 static void Log(const char* msg) {
     EnsureConfig();
-    if (g_logDisabled || !msg) {
+    if (g_logDisabled || !msg || t_inLog) {
         return;
     }
+    t_inLog = true;
     AcquireSRWLockExclusive(&g_logLock);
     EnsureLogOpenLocked();
     if (g_logFull || g_hLog == INVALID_HANDLE_VALUE) {
         ReleaseSRWLockExclusive(&g_logLock);
+        t_inLog = false;
         return;
     }
     SYSTEMTIME st {};
@@ -451,18 +464,81 @@ static void Log(const char* msg) {
         }
     }
     ReleaseSRWLockExclusive(&g_logLock);
+    t_inLog = false;
 }
 
 // So decrementa com orcamento positivo: falhas tardias continuam visiveis.
-// Nivel 2 registra tudo sem gastar.
+// Nivel 2 registra tudo sem gastar. Leitura simples antes do atomico: depois
+// de esgotado, o caminho quente nao paga operacao com lock.
 static bool TakeBudget(LONG* budget) {
     if (g_logLevel >= 2) {
         return true;
     }
-    if (InterlockedOr(budget, 0) <= 0) {
+    if (*static_cast<volatile LONG*>(budget) <= 0) {
         return false;
     }
     return InterlockedDecrement(budget) >= 0;
+}
+
+// Primeira ocorrencia por id (0..127), em qualquer nivel de log: o jogo
+// consulta a mesma feature dezenas de vezes por segundo (ruido que esgotava o
+// orcamento e, no nivel 2, serializava as threads no log).
+static LONG64 g_seenFeatures[2] = {};
+// Ids livres no fim da faixa (D3D12_FEATURE real < 64) para mensagens de spoof:
+// a primeira de cada uma sai mesmo que a 1a consulta FEATURE_LEVELS nao spoofe.
+static constexpr unsigned kLogIdSpoof = 126;
+static constexpr unsigned kLogIdSpoofUnsupported = 127;
+
+static bool FirstFeatureSeen(unsigned id) {
+    if (id >= 128) {
+        return TakeBudget(&g_featureLogBudget);
+    }
+    LONG64 bit = LONG64(1) << (id & 63);
+    LONG64* word = &g_seenFeatures[id >> 6];
+    if (*static_cast<volatile LONG64*>(word) & bit) {
+        return false;
+    }
+    return (InterlockedOr64(word, bit) & bit) == 0;
+}
+
+// Retries de PSO: loga a primeira vez de cada hash de PS (tabela sem lock).
+// Repeticoes so contam; a cada 100 retries sai um resumo. Tabela cheia cai no
+// orcamento comum.
+static constexpr size_t kSeenPsSlots = 512;
+static LONG g_seenPs[kSeenPsSlots] = {};
+static LONG g_retryCount = 0;
+
+static bool FirstRetryOfPs(uint32_t hash) {
+    uint32_t ukey = hash ? hash : 1u; // 0 = slot vazio
+    LONG key = static_cast<LONG>(ukey);
+    size_t i = ukey % kSeenPsSlots;
+    for (size_t n = 0; n < kSeenPsSlots; ++n, i = (i + 1) % kSeenPsSlots) {
+        LONG cur = *static_cast<volatile LONG*>(&g_seenPs[i]);
+        if (cur == key) {
+            return false;
+        }
+        if (cur == 0) {
+            LONG prev = InterlockedCompareExchange(&g_seenPs[i], key, 0);
+            if (prev == 0) {
+                return true;
+            }
+            if (prev == key) {
+                return false;
+            }
+        }
+    }
+    return TakeBudget(&g_psoFailureLogBudget);
+}
+
+static void Log(const char* msg);
+
+static void CountRetry() {
+    LONG n = InterlockedIncrement(&g_retryCount);
+    if (n % 100 == 0) {
+        char buf[96] {};
+        std::snprintf(buf, sizeof(buf), "Retries de PSO depth-only ate agora: %ld", n);
+        Log(buf);
+    }
 }
 
 static uint32_t Fnv1a(const void* data, size_t len) {
@@ -473,6 +549,54 @@ static uint32_t Fnv1a(const void* data, size_t len) {
         h *= 16777619u;
     }
     return h;
+}
+
+// Chave do PS para dedupe/log: containers DXBC/DXIL trazem um digest de 16
+// bytes no offset 4, entao a chave custa O(1) em vez de varrer 25-75KB.
+static uint32_t PsKey(const D3D12_SHADER_BYTECODE& ps) {
+    const unsigned char* b = static_cast<const unsigned char*>(ps.pShaderBytecode);
+    if (!b || !ps.BytecodeLength) {
+        return 0;
+    }
+    if (ps.BytecodeLength >= 20 && b[0] == 'D' && b[1] == 'X' && b[2] == 'B' && b[3] == 'C') {
+        static const unsigned char kZero[16] = {};
+        if (memcmp(b + 4, kZero, 16) != 0) { // DXIL sem validator vem com digest zerado
+            return Fnv1a(b + 4, 16);
+        }
+    }
+    return Fnv1a(b, ps.BytecodeLength);
+}
+
+// Copia do stream sem PS: pilha ate 4KB (stream valido maximo ~1,1KB), heap acima.
+struct StreamCopy {
+    alignas(8) unsigned char stack[4096];
+    unsigned char* p;
+    void* heap;
+    SIZE_T cap;
+    explicit StreamCopy(SIZE_T need) : p(stack), heap(nullptr), cap(sizeof(stack)) {
+        if (need > sizeof(stack)) {
+            heap = HeapAlloc(GetProcessHeap(), 0, need);
+            p = static_cast<unsigned char*>(heap);
+            cap = heap ? need : 0;
+        }
+    }
+    ~StreamCopy() {
+        if (heap) {
+            HeapFree(GetProcessHeap(), 0, heap);
+        }
+    }
+    StreamCopy(const StreamCopy&) = delete;
+    StreamCopy& operator=(const StreamCopy&) = delete;
+};
+
+static void LogStreamCopyFailed(SIZE_T size) {
+    static LONG s_once = 0;
+    if (InterlockedCompareExchange(&s_once, 1, 0) == 0) {
+        char buf[128] {};
+        std::snprintf(buf, sizeof(buf), "Stream PSO sem copia para retry (size=%zu): retry ignorado",
+            static_cast<size_t>(size));
+        Log(buf);
+    }
 }
 
 static bool ContainsInsensitiveW(const wchar_t* text, const wchar_t* needle) {
@@ -830,28 +954,98 @@ extern "C" void SpiderFixEnsureProcs() {
 // Sonda o adaptador que o jogo pediu (nao o padrao: notebook hibrido tem
 // iGPU e dGPU com niveis diferentes). ppDevice nulo nao cria device: S_FALSE
 // = suporta 12_1. Falha de sonda assume fix (comportamento seguro).
+// Resultado guardado por LUID (nullptr = adaptador padrao): a sonda roda uma
+// vez por adaptador, nao a cada D3D12CreateDevice.
+struct AdapterProbe {
+    bool isDefault;
+    LUID luid;
+    bool needsFix;
+};
+static AdapterProbe g_probes[8] = {};
+static size_t g_probeCount = 0;
+static SRWLOCK g_probeLock = SRWLOCK_INIT;
+
 static bool AdapterNeedsFix(IUnknown* pAdapter) {
+    AdapterProbe key {};
+    key.isDefault = (pAdapter == nullptr);
+    bool keyed = key.isDefault;
+    if (pAdapter) {
+        IDXGIAdapter* dxgi = nullptr;
+        DXGI_ADAPTER_DESC desc {};
+        if (SUCCEEDED(pAdapter->QueryInterface(__uuidof(IDXGIAdapter),
+                reinterpret_cast<void**>(&dxgi))) && dxgi) {
+            if (SUCCEEDED(dxgi->GetDesc(&desc))) {
+                key.luid = desc.AdapterLuid;
+                keyed = true;
+            }
+            dxgi->Release();
+        }
+    }
+    if (keyed) {
+        AcquireSRWLockShared(&g_probeLock);
+        for (size_t i = 0; i < g_probeCount; ++i) {
+            const AdapterProbe& p = g_probes[i];
+            if (p.isDefault == key.isDefault && p.luid.LowPart == key.luid.LowPart &&
+                p.luid.HighPart == key.luid.HighPart) {
+                bool r = p.needsFix;
+                ReleaseSRWLockShared(&g_probeLock);
+                return r;
+            }
+        }
+        ReleaseSRWLockShared(&g_probeLock);
+    }
     HRESULT hr = g_originalD3D12CreateDevice(pAdapter, D3D_FEATURE_LEVEL_12_1,
         __uuidof(ID3D12Device), nullptr);
-    return FAILED(hr);
+    key.needsFix = FAILED(hr);
+    // So guarda resposta definitiva; falha transitoria (memoria, device
+    // removido) assume fix agora e sonda de novo na proxima chamada.
+    bool definitive = SUCCEEDED(hr) || hr == static_cast<HRESULT>(DXGI_ERROR_UNSUPPORTED) ||
+        hr == E_INVALIDARG;
+    if (keyed && definitive) {
+        AcquireSRWLockExclusive(&g_probeLock);
+        if (g_probeCount < sizeof(g_probes) / sizeof(g_probes[0])) {
+            g_probes[g_probeCount++] = key;
+        }
+        ReleaseSRWLockExclusive(&g_probeLock);
+    }
+    return key.needsFix;
 }
 
-// Copia os originais da vtable do proprio objeto (leitura compartilhada barata).
-// Entradas de g_vhooks nunca mudam depois de registradas.
+// Copia os originais da vtable do proprio objeto, sem lock (ver g_vhooks).
+// Vtable desconhecida (outro hooker trocou o ponteiro de vtable do objeto por
+// uma copia com os nossos ponteiros): acha a entrada pelos slots que nao
+// hookamos (QueryInterface e GetNodeCount, 0 e 7), que a copia mantem. Com uma
+// so entrada usa ela; sem casamento entre varias devolve vazio (E_FAIL) em vez
+// de chamar o driver errado.
 static VtableHook LookupOriginals(const void* self) {
     VtableHook found {};
     if (!self) {
         return found;
     }
     void* vt = *reinterpret_cast<void* const*>(self);
-    AcquireSRWLockShared(&g_devicePatchLock);
-    for (size_t i = 0; i < g_vhookCount; ++i) {
+    size_t n = g_vhookCount.load(std::memory_order_acquire);
+    for (size_t i = 0; i < n; ++i) {
         if (g_vhooks[i].vtable == vt) {
+            return g_vhooks[i];
+        }
+    }
+    void* const* cvt = static_cast<void* const*>(vt);
+    for (size_t i = 0; i < n; ++i) {
+        void* const* rvt = static_cast<void* const*>(g_vhooks[i].vtable);
+        if (rvt[0] == cvt[0] && rvt[7] == cvt[7]) {
             found = g_vhooks[i];
             break;
         }
     }
-    ReleaseSRWLockShared(&g_devicePatchLock);
+    if (!found.vtable && n == 1) {
+        found = g_vhooks[0];
+    }
+    static LONG s_warned = 0;
+    if (n > 0 && InterlockedCompareExchange(&s_warned, 1, 0) == 0) {
+        Log(found.vtable ?
+            "Vtable desconhecida (outro hook trocou a tabela?): usando originais registrados" :
+            "Vtable desconhecida sem correspondencia entre varios drivers: chamada recusada");
+    }
     return found;
 }
 
@@ -868,8 +1062,9 @@ static HRESULT STDMETHODCALLTYPE HookedCheckFeatureSupport(
 
     HRESULT hr = original(self, feature, pFeatureSupportData, featureSupportDataSize);
 
-    bool verbose = TakeBudget(&g_featureLogBudget);
-    if (verbose) {
+    // Uma linha por feature em qualquer nivel: no nivel 2 logar toda chamada
+    // serializava as threads no log (picos de ms medidos em FORMAT_SUPPORT).
+    if (FirstFeatureSeen(static_cast<unsigned>(feature))) {
         char buf[256] {};
         std::snprintf(
             buf,
@@ -910,7 +1105,7 @@ static HRESULT STDMETHODCALLTYPE HookedCheckFeatureSupport(
             }
             if (wants12_0 || unary12_1) {
                 levels->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
-                if (verbose) {
+                if (FirstFeatureSeen(kLogIdSpoof)) {
                     Log("Spoof: FEATURE_LEVELS -> 12_0");
                 }
                 return S_OK;
@@ -920,7 +1115,7 @@ static HRESULT STDMETHODCALLTYPE HookedCheckFeatureSupport(
         if (hr == static_cast<HRESULT>(DXGI_ERROR_UNSUPPORTED) &&
             (wants12_0 || unary12_1)) {
             levels->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
-            if (verbose) {
+            if (FirstFeatureSeen(kLogIdSpoofUnsupported)) {
                 Log("Spoof: FEATURE_LEVELS UNSUPPORTED -> 12_0");
             }
             return S_OK;
@@ -1170,7 +1365,9 @@ static HRESULT STDMETHODCALLTYPE HookedCreateGraphicsPipelineState(
         patchedDesc.PS = {};
 
         HRESULT retryHr = original(self, &patchedDesc, riid, ppPipelineState);
-        if (TakeBudget(&g_psoFailureLogBudget)) {
+        uint32_t psKey = PsKey(desc->PS);
+        CountRetry();
+        if (FirstRetryOfPs(psKey) || g_logLevel >= 2) {
             char retryBuf[256] {};
             std::snprintf(
                 retryBuf,
@@ -1192,7 +1389,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateGraphicsPipelineState(
                 static_cast<unsigned>(desc->IBStripCutValue),
                 desc->VS.BytecodeLength,
                 desc->PS.BytecodeLength,
-                Fnv1a(desc->PS.pShaderBytecode, desc->PS.BytecodeLength),
+                psKey,
                 desc->DS.BytecodeLength,
                 desc->HS.BytecodeLength,
                 desc->GS.BytecodeLength);
@@ -1257,22 +1454,26 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePipelineStateStream(
         StreamScan s = ScanStream(
             desc->pPipelineStateSubobjectStream, desc->SizeInBytes);
         if (s.valid && s.depthOnlyPs) {
-            alignas(8) unsigned char buf[4096] = {};
+            StreamCopy buf(desc->SizeInBytes);
             SIZE_T outSize = 0;
-            if (BuildStreamWithoutPs(desc->pPipelineStateSubobjectStream,
-                    desc->SizeInBytes, buf, sizeof(buf), &outSize)) {
+            if (!buf.cap || !BuildStreamWithoutPs(desc->pPipelineStateSubobjectStream,
+                    desc->SizeInBytes, buf.p, buf.cap, &outSize)) {
+                LogStreamCopyFailed(desc->SizeInBytes);
+            } else {
                 D3D12_PIPELINE_STATE_STREAM_DESC patched = *desc;
-                patched.pPipelineStateSubobjectStream = buf;
+                patched.pPipelineStateSubobjectStream = buf.p;
                 patched.SizeInBytes = outSize;
                 HRESULT retryHr = original(self, &patched, riid, ppPipelineState);
-                if (TakeBudget(&g_psoFailureLogBudget)) {
+                uint32_t psKey = PsKey(*s.ps);
+                CountRetry();
+                if (FirstRetryOfPs(psKey) || g_logLevel >= 2) {
                     char retryBuf[256] {};
                     std::snprintf(retryBuf, sizeof(retryBuf),
                         "Stream PSO retry without PS: original 0x%08lX retry 0x%08lX PS=%zu(hash 0x%08X)",
                         static_cast<unsigned long>(hr),
                         static_cast<unsigned long>(retryHr),
                         s.ps->BytecodeLength,
-                        Fnv1a(s.ps->pShaderBytecode, s.ps->BytecodeLength));
+                        psKey);
                     Log(retryBuf);
                 }
                 if (SUCCEEDED(retryHr)) {
@@ -1373,7 +1574,12 @@ public:
             // E_INVALIDARG tambem e o cache miss normal (nome ausente): o retry
             // custa uma chamada a mais. So loga se o retry mudou o resultado.
             HRESULT retryHr = m_real->LoadGraphicsPipeline(name, &patched, riid, pp);
-            if (retryHr != hr && TakeBudget(&g_psoFailureLogBudget)) {
+            if (retryHr != hr) {
+                CountRetry();
+            }
+            // Dedupe compartilhado com CreateGraphicsPipelineState: o mesmo PS ja
+            // logado la nao repete aqui.
+            if (retryHr != hr && (FirstRetryOfPs(PsKey(desc->PS)) || g_logLevel >= 2)) {
                 char buf[256] {};
                 std::snprintf(buf, sizeof(buf),
                     "Library LoadGraphicsPipeline retry without PS: original 0x%08lX retry 0x%08lX",
@@ -1405,15 +1611,20 @@ public:
             StreamScan s = ScanStream(
                 desc->pPipelineStateSubobjectStream, desc->SizeInBytes);
             if (s.valid && s.depthOnlyPs) {
-                alignas(8) unsigned char buf[4096] = {};
+                StreamCopy buf(desc->SizeInBytes);
                 SIZE_T outSize = 0;
-                if (BuildStreamWithoutPs(desc->pPipelineStateSubobjectStream,
-                        desc->SizeInBytes, buf, sizeof(buf), &outSize)) {
+                if (!buf.cap || !BuildStreamWithoutPs(desc->pPipelineStateSubobjectStream,
+                        desc->SizeInBytes, buf.p, buf.cap, &outSize)) {
+                    LogStreamCopyFailed(desc->SizeInBytes);
+                } else {
                     D3D12_PIPELINE_STATE_STREAM_DESC patched = *desc;
-                    patched.pPipelineStateSubobjectStream = buf;
+                    patched.pPipelineStateSubobjectStream = buf.p;
                     patched.SizeInBytes = outSize;
                     HRESULT retryHr = lib1->LoadPipeline(name, &patched, riid, pp);
-                    if (retryHr != hr && TakeBudget(&g_psoFailureLogBudget)) {
+                    if (retryHr != hr) {
+                        CountRetry();
+                    }
+                    if (retryHr != hr && (FirstRetryOfPs(PsKey(*s.ps)) || g_logLevel >= 2)) {
                         char retryBuf[256] {};
                         std::snprintf(retryBuf, sizeof(retryBuf),
                             "Library LoadPipeline retry without PS: original 0x%08lX retry 0x%08lX",
@@ -1525,75 +1736,111 @@ static void PatchDeviceMethods(IUnknown* deviceUnknown) {
         return; // Ja hookado por outro device da mesma vtable.
     }
 
-    bool patched = false;
+    VtableHook e {};
+    bool known = false;
     bool tableFull = false;
     bool protFail = false;
+    int written = 0;
     AcquireSRWLockExclusive(&g_devicePatchLock);
-    size_t slot = kMaxVtableHooks;
-    for (size_t i = 0; i < g_vhookCount; ++i) {
+    size_t count = g_vhookCount.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
         if (g_vhooks[i].vtable == vtable) {
-            slot = i;
+            e = g_vhooks[i];
+            known = true;
             break;
         }
     }
-    if (slot != kMaxVtableHooks) {
-        patched = true; // Outra thread hookou entre a checagem e o lock.
-    } else if (g_vhookCount >= kMaxVtableHooks) {
-        tableFull = true;
-    } else {
-        CheckFeatureSupport_t origCheck =
-            reinterpret_cast<CheckFeatureSupport_t>(vtable[kCheckFeatureSupportVtableIndex]);
-        CreateGraphicsPipelineState_t origPso =
-            reinterpret_cast<CreateGraphicsPipelineState_t>(vtable[kCreateGraphicsPipelineStateVtableIndex]);
-        CreatePipelineState_t origStream = nullptr;
-        CreatePipelineLibrary_t origLib = nullptr;
-        if (wantStream) {
-            origStream = reinterpret_cast<CreatePipelineState_t>(
-                vtable[kCreatePipelineStateVtableIndex]);
-        }
-        if (wantLibrary) {
-            origLib = reinterpret_cast<CreatePipelineLibrary_t>(
-                vtable[kCreatePipelineLibraryVtableIndex]);
-        }
-        DWORD oldProtect = 0;
-        SIZE_T range = sizeof(void*) * (maxIdx - kCreateGraphicsPipelineStateVtableIndex + 1);
-        if (VirtualProtect(&vtable[kCreateGraphicsPipelineStateVtableIndex],
-                range, PAGE_READWRITE, &oldProtect)) {
-            vtable[kCreateGraphicsPipelineStateVtableIndex] =
-                reinterpret_cast<void*>(&HookedCreateGraphicsPipelineState);
-            vtable[kCheckFeatureSupportVtableIndex] =
-                reinterpret_cast<void*>(&HookedCheckFeatureSupport);
+    if (!known) {
+        if (count >= kMaxVtableHooks) {
+            tableFull = true;
+        } else {
+            // Slot que ja aponta para nosso hook (copia parcial de vtable feita
+            // por terceiro) nao vira "original": chamaria a si mesmo sem fim.
+            auto orig = [&](size_t idx, void* hook) -> void* {
+                return vtable[idx] == hook ? nullptr : vtable[idx];
+            };
+            e.vtable = vtable;
+            e.check = reinterpret_cast<CheckFeatureSupport_t>(orig(
+                kCheckFeatureSupportVtableIndex, reinterpret_cast<void*>(&HookedCheckFeatureSupport)));
+            e.pso = reinterpret_cast<CreateGraphicsPipelineState_t>(orig(
+                kCreateGraphicsPipelineStateVtableIndex,
+                reinterpret_cast<void*>(&HookedCreateGraphicsPipelineState)));
             if (wantStream) {
-                vtable[kCreatePipelineStateVtableIndex] =
-                    reinterpret_cast<void*>(&HookedCreatePipelineStateStream);
+                e.psoStream = reinterpret_cast<CreatePipelineState_t>(orig(
+                    kCreatePipelineStateVtableIndex,
+                    reinterpret_cast<void*>(&HookedCreatePipelineStateStream)));
             }
             if (wantLibrary) {
-                vtable[kCreatePipelineLibraryVtableIndex] =
-                    reinterpret_cast<void*>(&HookedCreatePipelineLibrary);
+                e.libCreate = reinterpret_cast<CreatePipelineLibrary_t>(orig(
+                    kCreatePipelineLibraryVtableIndex,
+                    reinterpret_cast<void*>(&HookedCreatePipelineLibrary)));
             }
-            DWORD ignored = 0;
-            VirtualProtect(&vtable[kCreateGraphicsPipelineStateVtableIndex],
-                range, oldProtect, &ignored);
-            g_vhooks[g_vhookCount].vtable = vtable;
-            g_vhooks[g_vhookCount].check = origCheck;
-            g_vhooks[g_vhookCount].pso = origPso;
-            g_vhooks[g_vhookCount].psoStream = origStream;
-            g_vhooks[g_vhookCount].libCreate = origLib;
-            ++g_vhookCount;
-            patched = true;
-        } else {
-            protFail = true;
+            // Publica antes de escrever na vtable: quem cair no hook ja acha a entrada.
+            g_vhooks[count] = e;
+            g_vhookCount.store(count + 1, std::memory_order_release);
+        }
+    }
+    if (!tableFull) {
+        // Mesma rotina para o patch inicial e para reaplicar: so troca slot que
+        // ainda tem o ponteiro original do driver (CAS). Slot ja nosso ou de
+        // outro hooker que veio depois (e nos chama) fica como esta. Cobre o
+        // "unhook" de terceiro que restaura o original por cima do nosso.
+        struct Slot { size_t idx; void* orig; void* hook; };
+        const Slot slots[] = {
+            { kCreateGraphicsPipelineStateVtableIndex, reinterpret_cast<void*>(e.pso),
+              reinterpret_cast<void*>(&HookedCreateGraphicsPipelineState) },
+            { kCheckFeatureSupportVtableIndex, reinterpret_cast<void*>(e.check),
+              reinterpret_cast<void*>(&HookedCheckFeatureSupport) },
+            { kCreatePipelineLibraryVtableIndex, reinterpret_cast<void*>(e.libCreate),
+              reinterpret_cast<void*>(&HookedCreatePipelineLibrary) },
+            { kCreatePipelineStateVtableIndex, reinterpret_cast<void*>(e.psoStream),
+              reinterpret_cast<void*>(&HookedCreatePipelineStateStream) },
+        };
+        size_t hi = kCheckFeatureSupportVtableIndex;
+        for (const Slot& sl : slots) {
+            if (sl.orig && sl.idx > hi) {
+                hi = sl.idx;
+            }
+        }
+        bool pending = false;
+        for (const Slot& sl : slots) {
+            if (sl.orig && vtable[sl.idx] == sl.orig) {
+                pending = true;
+            }
+        }
+        if (pending) {
+            DWORD oldProtect = 0;
+            SIZE_T range = sizeof(void*) * (hi - kCreateGraphicsPipelineStateVtableIndex + 1);
+            if (VirtualProtect(&vtable[kCreateGraphicsPipelineStateVtableIndex],
+                    range, PAGE_READWRITE, &oldProtect)) {
+                for (const Slot& sl : slots) {
+                    if (sl.orig && InterlockedCompareExchangePointer(
+                            &vtable[sl.idx], sl.hook, sl.orig) == sl.orig) {
+                        ++written;
+                    }
+                }
+                DWORD ignored = 0;
+                VirtualProtect(&vtable[kCreateGraphicsPipelineStateVtableIndex],
+                    range, oldProtect, &ignored);
+            } else {
+                protFail = true;
+            }
         }
     }
     ReleaseSRWLockExclusive(&g_devicePatchLock);
     device->Release();
 
-    if (patched) {
-        Log("Patch aplicado: ID3D12Device + Device1/Device2");
-    } else if (tableFull) {
+    if (tableFull) {
         Log("Tabela de vtables cheia, patch ignorado");
     } else if (protFail) {
         Log("VirtualProtect falhou ao patchar metodos do ID3D12Device");
+    } else if (!known) {
+        Log("Patch aplicado: ID3D12Device + Device1/Device2");
+    } else if (written > 0) {
+        char buf[96] {};
+        std::snprintf(buf, sizeof(buf),
+            "Patch reaplicado: %d slot(s) tinham voltado ao original do driver", written);
+        Log(buf);
     }
 }
 
@@ -1619,13 +1866,17 @@ static DWORD WINAPI OsdThread(LPVOID param) {
     }
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
-    HWND w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+    // LAYERED + TRANSPARENT: cliques atravessam a janela e o DWM compoe so a
+    // regiao dela, sem disputar foco com o jogo.
+    HWND w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
+        WS_EX_LAYERED | WS_EX_TRANSPARENT,
         kCls, text, WS_POPUP | WS_CAPTION | WS_SYSMENU,
         (sw > 420 ? sw - 420 : 0), (sh > 140 ? sh - 140 : 0),
         400, 80, nullptr, nullptr, inst, nullptr);
     if (!w) {
         return 0;
     }
+    SetLayeredWindowAttributes(w, 0, 230, LWA_ALPHA); // Sem isso janela layered nao aparece.
     ShowWindow(w, SW_SHOWNOACTIVATE);
     SetTimer(w, 1, 4000, nullptr);
     MSG msg {};
@@ -1682,6 +1933,17 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
             GET_MODULE_HANDLE_EX_FLAG_PIN,
             reinterpret_cast<LPCWSTR>(&D3D12CreateDevice), &pinned);
+    }
+
+    // O fix sustenta ate 12_1. Pedido acima (12_2: mesh shaders, sampler
+    // feedback...) passa direto: fingir suporte faria o jogo usar recurso que a
+    // GPU nao tem. Vale para a sonda (ppDevice nulo) e para a criacao real.
+    if (minimumFeatureLevel > D3D_FEATURE_LEVEL_12_1) {
+        char buf[96] {};
+        std::snprintf(buf, sizeof(buf), "FL pedido 0x%X > 12_1: repasse direto",
+            static_cast<unsigned>(minimumFeatureLevel));
+        Log(buf);
+        return g_originalD3D12CreateDevice(pAdapter, minimumFeatureLevel, riid, ppDevice);
     }
 
     // Adaptador do jogo com 12_1+ ignora o fix (passthrough puro, sem hooks).

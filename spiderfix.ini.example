@@ -5,7 +5,7 @@
 # Log mestre: 0 off, 1 com orcamento (padrao)
 Log = 1
 
-# Nivel de detalhe: 0 off, 1 com orcamento (padrao), 2 sem limite
+# Nivel de detalhe: 0 off, 1 cada evento novo uma vez (padrao), 2 tambem cada retry de PSO repetido
 LogLevel = 1
 
 # Forca o fix mesmo em GPU 12_1+ (padrao 0)

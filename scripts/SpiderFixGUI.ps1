@@ -34,7 +34,8 @@ $form.Controls.Add($lbl)
 $txtPath = New-Object System.Windows.Forms.TextBox
 $txtPath.Location = New-Object System.Drawing.Point(12, $y + 22)
 $txtPath.Size = New-Object System.Drawing.Size(320, 20)
-$detected = Find-SpiderManPath
+$detected = $null
+try { $detected = Find-SpiderManPath } catch {} # Biblioteca em drive desconectado nao derruba a GUI.
 if ($detected) {
     $txtPath.Text = $detected
 } else {
@@ -57,27 +58,38 @@ $form.Controls.Add($btnBrowse)
 
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Location = New-Object System.Drawing.Point(12, 106)
-$lblStatus.Size = New-Object System.Drawing.Size(418, 18)
+$lblStatus.Size = New-Object System.Drawing.Size(418, 30)
 $form.Controls.Add($lblStatus)
 
 function Update-Status {
     $gp = $txtPath.Text
-    $d = Join-Path $gp "d3d12.dll"
-    if (!(Test-SpiderManDir $gp)) {
-        $lblStatus.Text = "Status: pasta sem $SpiderFixGameExe"
-    } elseif (!(Test-Path -LiteralPath $d)) {
-        $lblStatus.Text = "Status: Nao instalado"
-    } elseif (Test-SpiderFixDll $d) {
-        $lblStatus.Text = "Status: Instalado (SpiderFix v" + (Get-Item -LiteralPath $d).VersionInfo.ProductVersion + ")"
-    } else {
-        $lblStatus.Text = "Status: Outra d3d12.dll presente (outro mod)"
+    try {
+        # Combine: Join-Path lanca com caminho vazio ou drive inexistente.
+        $d = [System.IO.Path]::Combine($gp, "d3d12.dll")
+        if (!(Test-SpiderManDir $gp)) {
+            $lblStatus.Text = "Status: pasta sem $SpiderFixGameExe"
+        } elseif (!(Test-Path -LiteralPath $d)) {
+            $lblStatus.Text = "Status: Nao instalado"
+        } elseif (Test-SpiderFixDll $d) {
+            $lblStatus.Text = "Status: Instalado (SpiderFix v" + (Get-Item -LiteralPath $d).VersionInfo.ProductVersion + ")"
+        } else {
+            $lblStatus.Text = "Status: Outra d3d12.dll presente (outro mod)"
+        }
+    } catch {
+        $lblStatus.Text = "Status: caminho invalido" # Nao deixa o texto anterior (ex.: "Instalado").
     }
+    $lblStatus.Text += "`ncache.pso jogo: " + (Get-SpiderFixCacheState $gp) +
+        " | AppData: " + (Get-SpiderFixCacheState (Get-SpiderFixAppDataDir))
 }
-$txtPath.Add_TextChanged({ try { Update-Status } catch {} })
+# Debounce de 300 ms: Update-Status faz Test-Path na thread de UI (drive de rede lento trava).
+$statusTimer = New-Object System.Windows.Forms.Timer
+$statusTimer.Interval = 300
+$statusTimer.Add_Tick({ $statusTimer.Stop(); try { Update-Status } catch {} })
+$txtPath.Add_TextChanged({ $statusTimer.Stop(); $statusTimer.Start() })
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = New-Object System.Drawing.Point(12, 128)
-$log.Size = New-Object System.Drawing.Size(418, 162)
+$log.Location = New-Object System.Drawing.Point(12, 140)
+$log.Size = New-Object System.Drawing.Size(418, 150)
 $log.Multiline = $true
 $log.ScrollBars = "Vertical"
 $log.ReadOnly = $true
@@ -93,6 +105,7 @@ function Invoke-FixScript([string]$script) {
     $outF = [System.IO.Path]::GetTempFileName()
     $errF = [System.IO.Path]::GetTempFileName()
     $buttons | ForEach-Object { $_.Enabled = $false }
+    $script:busy = $true
     try {
         $a = "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
         if ($txtPath.Text) {
@@ -119,6 +132,7 @@ function Invoke-FixScript([string]$script) {
     } catch {
         Write-Log ("ERRO: " + $_.Exception.Message)
     } finally {
+        $script:busy = $false
         Remove-Item -LiteralPath $outF, $errF -Force -ErrorAction SilentlyContinue
         $buttons | ForEach-Object { $_.Enabled = $true }
         try { Update-Status } catch {}
@@ -144,21 +158,13 @@ $btnCache.Text = "Alternar cache.pso"
 $btnCache.Location = New-Object System.Drawing.Point(216, 70)
 $btnCache.Size = New-Object System.Drawing.Size(118, 30)
 $btnCache.Add_Click({
-    $c = Join-Path $txtPath.Text "cache.pso"
-    $cd = Join-Path $txtPath.Text "cache.pso.disabled"
+    # Pasta do jogo e %APPDATA%: o jogo le os dois cache.pso.
     try {
-        if ((Test-Path -LiteralPath $c) -and !(Test-Path -LiteralPath $cd)) {
-            Rename-Item -LiteralPath $c -NewName "cache.pso.disabled"
-            Write-Log "cache.pso desativado."
-        } elseif ((Test-Path -LiteralPath $cd) -and !(Test-Path -LiteralPath $c)) {
-            Rename-Item -LiteralPath $cd -NewName "cache.pso"
-            Write-Log "cache.pso ativado."
-        } else {
-            Write-Log "Nada a alternar."
-        }
+        Switch-SpiderFixCache $txtPath.Text | ForEach-Object { Write-Log $_ }
     } catch {
         Write-Log ("ERRO: " + $_.Exception.Message)
     }
+    try { Update-Status } catch {}
 })
 $form.Controls.Add($btnCache)
 
@@ -179,6 +185,9 @@ $btnDiag.Add_Click({
         } catch {
             [void]$sb.AppendLine("Windows: nao lido")
         }
+        [void]$sb.AppendLine("cache.pso jogo: " + (Get-SpiderFixCacheState $gp))
+        [void]$sb.AppendLine("cache.pso AppData: " + (Get-SpiderFixCacheState (Get-SpiderFixAppDataDir)) +
+            " (" + (Get-SpiderFixAppDataDir) + ")")
         $exe = Join-Path $gp $SpiderFixGameExe
         if (Test-Path -LiteralPath $exe) {
             [void]$sb.AppendLine("$SpiderFixGameExe FileVersion: " + (Get-Item -LiteralPath $exe).VersionInfo.FileVersion)
@@ -223,6 +232,14 @@ $btnDiag.Add_Click({
 $form.Controls.Add($btnDiag)
 
 $buttons = @($btnBrowse, $btnInstall, $btnUninstall, $btnCache, $btnDiag)
+# Fechar durante a espera descartaria o form no meio do laco DoEvents (ObjectDisposedException).
+$script:busy = $false
+$form.Add_FormClosing({
+    if ($script:busy) {
+        $_.Cancel = $true
+        Write-Log "Aguarde o fim da operacao antes de fechar."
+    }
+})
 try { Update-Status } catch {}
 
 [void]$form.ShowDialog()

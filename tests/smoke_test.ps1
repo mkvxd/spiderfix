@@ -7,25 +7,39 @@
 # Uso: powershell -ExecutionPolicy Bypass -File tests/smoke_test.ps1
 
 [CmdletBinding()]
-param([switch]$Child)
+param([switch]$Child, [string]$Dir)
 
 $ErrorActionPreference = "Stop"
 
 if (-not $Child) {
     $hadForce = Test-Path Env:\SPIDERFIX_FORCE
     $oldForce = $env:SPIDERFIX_FORCE
+    $skipped = $false
     try {
         foreach ($force in @($null, "1")) {
             if ($force) { $env:SPIDERFIX_FORCE = $force } else { Remove-Item Env:\SPIDERFIX_FORCE -ErrorAction SilentlyContinue }
             Write-Output ("== SPIDERFIX_FORCE=" + $(if ($force) { $force } else { "(vazio)" }))
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Child
-            if ($LASTEXITCODE -ne 0) { throw "Smoke test falhou (SPIDERFIX_FORCE=$force): $LASTEXITCODE" }
+            # Pai cria e apaga a pasta: o filho nao consegue apagar com a DLL fixada carregada.
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("spiderfix_smoke_" + [Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            try {
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Child -Dir $dir
+                if ($LASTEXITCODE -eq 2) { $skipped = $true; continue } # Filho: sem adaptador D3D12.
+                if ($LASTEXITCODE -ne 0) { throw "Smoke test falhou (SPIDERFIX_FORCE=$force): $LASTEXITCODE" }
+            } finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     } finally {
         if ($hadForce) { $env:SPIDERFIX_FORCE = $oldForce } else { Remove-Item Env:\SPIDERFIX_FORCE -ErrorAction SilentlyContinue }
     }
-    Write-Output "Smoke test passou."
-    return
+    if ($skipped -and $env:CI) {
+        # Em CI, PULADO nao pode contar como verde: nada teria sido exercitado.
+        Write-Output "Smoke test FALHOU: PULADO (sem adaptador D3D12) nao e aceito com CI definido."
+        exit 1
+    }
+    if ($skipped) { Write-Output "Smoke test PULADO: sem adaptador D3D12." } else { Write-Output "Smoke test passou." }
+    exit 0 # Explicito: o wrapper do GitHub usa $LASTEXITCODE do ultimo filho.
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -35,8 +49,7 @@ if (!(Test-Path -LiteralPath $releaseDll)) {
     throw "release\d3d12.dll ausente. Rode build_spider_proxy.ps1 antes."
 }
 
-$dir = Join-Path ([System.IO.Path]::GetTempPath()) ("spiderfix_smoke_" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $dir | Out-Null
+if (-not $Dir) { throw "-Child exige -Dir (pasta criada pelo pai)." }
 try {
     Copy-Item -LiteralPath $releaseDll -Destination (Join-Path $dir "d3d12.dll") -Force
     $env:SPIDERFIX_LOG = "1"
@@ -78,6 +91,11 @@ public static class H {
         $g = [Guid]::new("189819f1-1db6-4b57-be54-1821339b85f7")
         [IntPtr]$dev = [IntPtr]::Zero
         $hr = $cd.Invoke([IntPtr]::Zero, 0xc000, [ref]$g, [ref]$dev)
+        # DXGI_ERROR_UNSUPPORTED: runner sem D3D12 FL 12_0 no driver basico. Outros hr seguem falhando.
+        if (("0x{0:X8}" -f $hr) -eq "0x887A0004") {
+            Write-Output "SKIP: sem adaptador D3D12"
+            exit 2 # Pai trata 2 como pulado (exit 0 do script).
+        }
         if ($hr -ne 0 -or $dev -eq [IntPtr]::Zero) {
             throw ("D3D12CreateDevice falhou: hr=0x{0:X8}" -f $hr)
         }
@@ -104,5 +122,4 @@ public static class H {
 } finally {
     Remove-Item Env:\SPIDERFIX_LOG -ErrorAction SilentlyContinue
     Remove-Item Env:\SPIDERFIX_OSD -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -10,26 +10,40 @@ if (-not $Case) {
         @{ n='slowpath'; ini=$null; enc=$null; env=@{}; expect={ param($log,$r) $r -match 'SLOW hr=0x' -and $r -match 'PIX ok' } },
         @{ n='utf16-force-inline'; ini="ForceActive = yes # liga`r`nLogLevel = 0 ; desliga`r`n"; enc='Unicode'; env=@{}; expect={ param($log) $log -eq '<sem log>' } },
         @{ n='utf8bom-first-key'; ini="Log=0`r`n"; enc='UTF8'; env=@{}; expect={ param($log) $log -eq '<sem log>' } },
-        @{ n='bom-unknown-only'; ini="ForceActive=off`r`nFoo=1`r`n"; enc='UTF8'; env=@{SPIDERFIX_FORCE='1'}; expect={ param($log) $log -match "spiderfix.ini: chave desconhecida 'Foo'$" -or $log -match "spiderfix.ini: chave desconhecida 'Foo'" } },
+        @{ n='bom-unknown-only'; ini="ForceActive=off`r`nFoo=1`r`n"; enc='UTF8'; env=@{SPIDERFIX_FORCE='1'}; expect={ param($log) $log -match "spiderfix.ini: chave desconhecida 'Foo'(\r|$)" } },
         @{ n='unknown-key'; ini="Foo=1`r`nShowOSD=talvez`r`n"; enc='ASCII'; env=@{}; expect={ param($log) $log -match "chave desconhecida 'Foo'" -and $log -match "valor invalido em 'ShowOSD'" } },
         @{ n='loglevel-wins'; ini="LogLevel=0`r`nLog=1`r`n"; enc='ASCII'; env=@{}; expect={ param($log) $log -eq '<sem log>' } }
     )
     $fail = 0
     foreach ($c in $cases) {
         $d = Join-Path $env:TEMP ("sfchk_" + $c.n + "_" + [guid]::NewGuid().ToString('N').Substring(0,6))
-        New-Item -ItemType Directory -Path $d | Out-Null
-        Copy-Item $dll (Join-Path $d 'd3d12.dll')
-        if ($c.ini) { Set-Content -LiteralPath (Join-Path $d 'spiderfix.ini') -Value $c.ini -Encoding $c.enc -NoNewline }
+        $envs = $c.env + @{ SPIDERFIX_OSD = '0' }
         $old = @{}
-        foreach ($k in $c.env.Keys) { $old[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $c.env[$k]) }
-        $env:SPIDERFIX_OSD = '0'
-        $r = & powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Case $c.n -Dir $d 2>&1 | Out-String
-        foreach ($k in $c.env.Keys) { [Environment]::SetEnvironmentVariable($k, $old[$k]) }
-        $lp = Join-Path $d 'spiderfix.log'
-        $log = if (Test-Path $lp) { Get-Content $lp -Raw } else { '<sem log>' }
-        $ok = & $c.expect $log $r
-        if ($ok) { "PASS: $($c.n)" } else { $fail++; "FAIL: $($c.n)`n--- child:`n$r`n--- log:`n$log" }
-        Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue
+        try {
+            New-Item -ItemType Directory -Path $d | Out-Null
+            Copy-Item $dll (Join-Path $d 'd3d12.dll')
+            if ($c.ini) { Set-Content -LiteralPath (Join-Path $d 'spiderfix.ini') -Value $c.ini -Encoding $c.enc -NoNewline }
+            foreach ($k in $envs.Keys) { $old[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $envs[$k]) }
+            # Continue local: no PS 5.1, stderr do filho com 2>&1 sob Stop vira excecao terminante.
+            $r = & { $ErrorActionPreference = 'Continue'; & powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Case $c.n -Dir $d 2>&1 | Out-String }
+            $rc = $LASTEXITCODE
+            $lp = Join-Path $d 'spiderfix.log'
+            $log = if (Test-Path $lp) { Get-Content $lp -Raw } else { '<sem log>' }
+            # DXGI_ERROR_UNSUPPORTED: runner sem D3D12 FL 12_0 no driver basico.
+            # Em CI, SKIP conta como falha: senao tudo pulado daria verde sem exercitar nada.
+            if ($r -match 'CreateDevice hr=0x887A0004') {
+                if ($env:CI) { $fail++; "FAIL: SKIP nao aceito com CI definido, sem adaptador D3D12 ($($c.n))" } else { "SKIP: sem adaptador D3D12 ($($c.n))" }
+                continue
+            }
+            # Exige que o filho chegou ao fim: '<sem log>' sozinho passaria com crash antes de logar.
+            $ok = ($rc -eq 0) -and ($c.n -eq 'slowpath' -or $r -match 'CreateDevice hr=0x') -and (& $c.expect $log $r)
+            if ($ok) { "PASS: $($c.n)" } else { $fail++; "FAIL: $($c.n) (exit=$rc)`n--- child:`n$r`n--- log:`n$log" }
+        } catch {
+            $fail++; "FAIL: $($c.n)`n$_"
+        } finally {
+            foreach ($k in $old.Keys) { [Environment]::SetEnvironmentVariable($k, $old[$k]) }
+            Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue
+        }
     }
     "falhas=$fail"
     exit $fail

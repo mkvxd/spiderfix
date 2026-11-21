@@ -4,7 +4,7 @@
 
 **Makes Marvel's Spider-Man 2 launch on graphics cards without DirectX 12 feature level 12_1.**
 
-![Version](https://img.shields.io/badge/version-2.0-2ea44f)
+![Version](https://img.shields.io/badge/version-2.1-2ea44f)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011%20x64-0078D4?logo=windows&logoColor=white)
 ![DirectX](https://img.shields.io/badge/DirectX-12-107C10)
 ![Tested](https://img.shields.io/badge/tested-RX%20580-ED1C24?logo=amd&logoColor=white)
@@ -26,6 +26,7 @@ On cards that already support 12_1, the DLL detects it on its own and stays out 
 - [Troubleshooting](#troubleshooting)
 - [How it works](#how-it-works)
 - [Building from source](#building-from-source)
+- [What's new in v2.1](#whats-new-in-v21)
 - [What's new in v2.0](#whats-new-in-v20)
 - [Tested versions](#tested-versions)
 - [Antivirus and safety](#antivirus-and-safety)
@@ -93,7 +94,7 @@ The window shows the state of the selected folder (installed and version, not in
 |--------|--------|
 | Instalar (Install) | Runs `install_fix.ps1` without freezing the window and shows its output. |
 | Desinstalar (Uninstall) | Runs `uninstall_fix.ps1`. |
-| Alternar cache.pso | Enables or disables the game's shader cache (useful if it hangs on loading). |
+| Alternar cache.pso | Enables or disables the game's shader cache in both places it lives: the game folder and `%APPDATA%\Insomniac Games\Marvel's Spider-Man 2`. Useful if it hangs on loading. |
 | Diagnostico | Writes a report to the Desktop: Windows and game version, `spiderfix.ini` contents, other proxy DLLs in the folder and the DLL's SHA256. Attach it when opening an issue. |
 
 ## Configuration
@@ -103,7 +104,7 @@ Nothing needs configuring. To tweak, copy `spiderfix.ini.example` into the game 
 | INI key | Variable | Default | Effect |
 |---------|----------|---------|--------|
 | `Log` | `SPIDERFIX_LOG` | 1 | Writes `spiderfix.log` next to the DLL. |
-| `LogLevel` | — | 1 | 0 off, 1 rate-limits repetitive messages, 2 logs everything. Wins over `Log`. |
+| `LogLevel` | — | 1 | 0 off, 1 logs each new event once, 2 also logs every repeated PSO retry. Wins over `Log`. |
 | `ForceActive` | `SPIDERFIX_FORCE` | 0 | Applies the fix even on 12_1-or-newer cards. |
 | `DepthRetry` | `SPIDERFIX_DEPTH_RETRY` | 1 | Recreates depth-only PSOs without a pixel shader when the driver rejects them. Without it the game hangs. |
 | `HookPipelineLibrary` | `SPIDERFIX_HOOK_LIB` | 1 | Applies the same retry to shaders loaded from `cache.pso`. |
@@ -120,8 +121,8 @@ The log is capped at 512 KB; past that it becomes `spiderfix.log.old` and a new 
 | "Running scripts is disabled on this system" | Run `Get-ChildItem -Recurse \| Unblock-File` in the extracted folder and use `powershell -ExecutionPolicy Bypass -File ...`. |
 | The installer can't find the game | Pass `-GamePath` with the folder that contains `Spider-Man2.exe`. |
 | The game won't start after installing | Generate the diagnostic in the GUI and check for another proxy DLL (`dxgi.dll`, `dinput8.dll`...) in the folder. Open an issue with the report and `spiderfix.log`. |
-| Hangs on the loading screen | Disable `cache.pso` (GUI button, or rename it to `cache.pso.disabled`). The game rebuilds its shaders on the next launch. |
-| Odd shadows or depth on some objects | Known side effect of the PSO retry (see [How it works](#how-it-works)). It is the price of not hanging. |
+| Hangs on the loading screen | Disable `cache.pso` (GUI button, or rename it to `cache.pso.disabled` in the game folder **and** in `%APPDATA%\Insomniac Games\Marvel's Spider-Man 2`). The game rebuilds its shaders on the next launch. With the cache enabled the game compiles fewer shaders mid-play and stutters less. |
+| Some visual effect looks incomplete | Known side effect of the PSO retry (see [How it works](#how-it-works)). It is the price of not hanging. |
 | `spiderfix.log` doesn't appear | Make sure the INI has no `Log=0` or `LogLevel=0` and that there is no `SPIDERFIX_LOG=0` variable on the system. |
 | I want to know whether the fix is active | The 4 s notice says "modo FIX" or "modo BYPASS". The log records every step. |
 
@@ -134,9 +135,9 @@ Windows loads the `d3d12.dll` in the game folder before the system one. SpiderFi
 | Part | What it does |
 |------|--------------|
 | Detection | Asks the driver whether the card **the game picked** supports 12_1 (this matters on laptops with two GPUs). If it does, everything is forwarded with no hooks at all. |
-| Device creation | Tries 12_0 before the level the game asked for, then 11_1 and 11_0. Errors that are not about support go back to the game untouched. |
+| Device creation | Tries 12_0 before the level the game asked for, then 11_1 and 11_0. Requests above 12_1 (e.g. 12_2) pass straight through, with no faked support. Errors that are not about support go back to the game untouched. |
 | `CheckFeatureSupport` | Answers 12_0 to the feature-level query when the driver reports less. No other query is changed: features the card lacks are still reported as missing. |
-| Depth-only PSO | When the driver rejects a depth-only pipeline that has a pixel shader, recreates it without the shader. This avoids the `0x887A0006` hang, but PSOs that use the shader for cutouts (alpha-test) may produce imperfect shadows. |
+| Depth-only PSO | On the RX 580 the driver rejects depth-only pipelines whose pixel shader uses ROVs (rasterizer ordered views); plain alpha-test (`clip`) works. SpiderFix recreates those pipelines without the shader, which avoids the `0x887A0006` hang. The cost is losing that pass's ROV writes, which may leave some effect incomplete. |
 | Incompatible-GPU notice | Dismisses the game's requirements popup. It only acts during the first 3 minutes and never on crash or device-removed messages. Every game `MessageBox`, dismissed or not, goes to the log. |
 | Other exports | Forwarded straight to the system DLL through a jump table. |
 
@@ -160,6 +161,30 @@ Then, in an x64 PowerShell:
 ```
 
 The build uses `/W4 /permissive- /guard:cf /Brepro` and the static CRT (no redistributable needed). Every `v*` tag pushed to GitHub builds the release automatically, with `SHA256SUMS.txt` and a provenance attestation.
+
+## What's new in v2.1
+
+**Stability alongside other tools**
+- If a capture tool or overlay swaps or undoes the device hooks, the fix stays active instead of breaking shader creation.
+- Feature-level requests above 12_1 go straight to the driver, with no faked support.
+
+**Performance**
+- The log records each event once. With `LogLevel=2`, `CheckFeatureSupport` no longer stutters (from ~28 µs with 4 ms spikes down to ~0.3 µs on the RX 580).
+- GPU detection runs once per adapter.
+
+**Install and removal**
+- Atomic DLL copy (temp file, hash, swap): an interruption never leaves a corrupted DLL.
+- Backups are built in a temp folder and renamed at the end; names include milliseconds.
+- The uninstaller requires `manifest.json` and checks the hash before deleting any backup.
+- Read-only files no longer break installation.
+- Game-folder detection no longer fails with a Steam library on a disconnected drive or an accented path.
+
+**GUI**
+- "Alternar cache.pso" also covers `%APPDATA%\Insomniac Games\Marvel's Spider-Man 2`, where the game writes its own cache. The uninstaller only re-enables caches the GUI disabled.
+- The window can't be closed mid-operation and shows the output of an elevated install.
+
+**Documentation**
+- The real cause of the RX 580 failure is explained: the driver rejects depth-only pipelines whose pixel shader uses ROVs.
 
 ## What's new in v2.0
 
